@@ -1,0 +1,17 @@
+.env
+.itr/
+.claude/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.stackdump
+
+# Real ITRs carry PAN, Aadhaar, address and bank account numbers.
+# Never commit them. Keep local samples here; they stay untracked.
+samples/
+*.pdf
+*.xlsx
+
+cmp_sample.py
+
+golden_vision_run.log
