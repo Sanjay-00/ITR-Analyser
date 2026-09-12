@@ -154,14 +154,15 @@ def test_classified_by_content_not_by_heading():
     ("(a) Share Capital",                 "equity_capital"),
     ("Proprietor's Capital Account",      "equity_capital"),
     ("(b) Reserves and Surplus",          "reserves"),
-    ("(b) Trade Payables",                "current_liabilities"),
-    ("Sundry Creditors",                  "current_liabilities"),
+    # The master format keeps trade payables / receivables on rows of their
+    # own (for Creditor and Debtor Days).
+    ("(b) Trade Payables",                "sundry_creditors"),
+    ("Sundry Creditors",                  "sundry_creditors"),
+    ("[CL] Sundry Creditors",             "sundry_creditors"),
     ("(i) Tangible Assets",               "fixed_assets"),
     ("(d) Cash and Cash equivalents",     "current_assets"),
-    # No standalone Debtors row in this template - receivables fold into
-    # Current Assets (confirmed against the analyst's own Borrower K template).
-    ("Sundry Debtors & Other Receivable", "current_assets"),
-    ("(c) Trade Receivables",             "current_assets"),
+    ("Sundry Debtors & Other Receivable", "debtors"),
+    ("(c) Trade Receivables",             "debtors"),
     ("[NCA] (b) Right-of-use assets",     "fixed_assets"),
     ("(ii) Lease liabilities",            "unsecured_loans"),
     ("Depreciation and Amortization Expense", "depreciation"),
@@ -341,9 +342,15 @@ def test_every_row_key_is_labelled_or_a_section_row():
             assert label or key in C.LABELS, f"{key!r} has no label"
 
 
-def test_snap_rows_are_labelled():
-    for key in C.SNAP_ROWS:
-        assert key in C.SNAP_LABELS or key in C.LABELS, f"{key!r} has no label"
+def test_every_formula_refers_only_to_real_rows():
+    """A {key} placeholder that names no ROWS entry would crash the export."""
+    import re
+    row_keys = {key for kind, key, _l in C.ROWS if kind in ("item", "total")}
+    templates = (list(C.TOTAL_FORMULAS.values()) + [f for _n, f, _fmt in C.RATIOS]
+                 + [f for _l, f in C.SNAP])
+    for tmpl in templates:
+        for key in re.findall(r"\{(\w+)\}", tmpl):
+            assert key in row_keys, f"{tmpl!r} refers to {key!r}, not a sheet row"
 
 
 # ── Entity resolution ─────────────────────────────────────────────

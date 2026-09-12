@@ -315,12 +315,14 @@ _CATALOGUE = {
     "other_lt_liabilities":        "other long-term or non-current liabilities and provisions",
     "unsecured_loans":             "unsecured loans, loans from directors/partners/relatives",
     "deferred_tax_liability":      "deferred tax liability",
-    "current_liabilities":         "creditors, trade/sundry payables, duties and taxes, short-term provisions",
+    "sundry_creditors":            "trade payables, sundry creditors, creditors for goods or services",
+    "current_liabilities":         "other current liabilities: duties and taxes, short-term provisions, advances received",
     "fixed_assets":                "tangible fixed assets, plant, machinery, vehicles, furniture, CWIP",
     "intangible_assets":           "intangible assets, goodwill",
     "investments":                 "investments, shares, fixed deposits, gold",
     "deferred_tax_assets":         "deferred tax asset",
-    "current_assets":              "debtors/receivables, stock, cash, bank balances, short-term advances",
+    "debtors":                     "trade receivables, sundry debtors, bills receivable",
+    "current_assets":              "stock, cash, bank balances, short-term advances, other current assets",
     "lt_loans_advances":           "long-term loans and advances",
     "other_non_current_assets":    "other non-current assets",
 }
@@ -486,7 +488,8 @@ PL_KEYS = (PL_INCOME + PL_EXPENSE + PL_TAX
            + ["gross_receipts", "gross_expenses", "profit_before_tax",
               "profit_after_tax", "profit_available", "cash_profit"])
 BS_KEYS = (BS_LIABILITY + BS_ASSET
-           + ["total_liabilities", "total_assets", "networth"])
+           + ["total_liabilities", "total_assets", "networth",
+              "total_current_liabilities", "total_current_assets"])
 
 
 def compute(buckets: dict, have_pl: bool = True, have_bs: bool = True) -> dict:
@@ -518,7 +521,13 @@ def compute(buckets: dict, have_pl: bool = True, have_bs: bool = True) -> dict:
 
     out["total_liabilities"] = sum(_g(out, k) for k in BS_LIABILITY)
     out["total_assets"]      = sum(_g(out, k) for k in BS_ASSET)
-    out["networth"]          = _g(out, "equity_capital") + _g(out, "reserves")
+    # As the sheet's Financial Snap: Equity + Preference Shares + Reserves.
+    out["networth"]          = (_g(out, "equity_capital") + _g(out, "preference_shares")
+                                + _g(out, "reserves"))
+    # Not sheet rows: the Analysis tab's view of all current items.
+    out["total_current_liabilities"] = (_g(out, "sundry_creditors")
+                                        + _g(out, "current_liabilities"))
+    out["total_current_assets"]      = _g(out, "debtors") + _g(out, "current_assets")
 
     # A statement that WAS read confidently reports "no such line" as 0, not
     # "Check ITR" - a logistics business genuinely has no Purchases & Raw
@@ -547,58 +556,53 @@ def _div(num, den):
 
 def ratios(v: dict) -> dict:
     """
-    The analyst's ratio block. None wherever the denominator is zero.
+    The sheet's RATIOS block, computed in Python for the app and the Analysis
+    tab. None wherever the denominator is zero (the app shows "n/a"); the
+    Excel sheet itself carries the live formulas in template_config.RATIOS,
+    which show 0 there instead. Keys and order match template_config.
+    RATIO_NAMES, and tests/test_master_excel.py evaluates the Excel formulas
+    to prove the two give the same numbers.
 
-    Matches template_config.RATIO_NAMES exactly, in order - excel_generator
-    reads the keys of this dict to decide what rows to print, so the two
-    must stay in step. "DSCR" is deliberately NOT computed here: it depends
-    on EMI figures no statement carries, and is written by excel_generator as
-    a live formula pointing at the DSCR Calculation block instead.
+    "(inclusive q/e)" - INCLUSIVE OF QUASI-EQUITY: unsecured loans (from the
+    proprietor, partners, directors, relatives) count as the owners' own
+    money for the gearing ratios - added to equity, taken out of debt. This
+    reproduces the analyst's reference sheet exactly (Borrower L FY2024:
+    304.74 / (269.24 + 3.00) = 1.119 and 393.23 / 272.24 = 1.444).
     """
-    networth   = _g(v, "networth")
-    pat        = _g(v, "profit_after_tax")
-    pbt        = _g(v, "profit_before_tax")
-    interest   = _g(v, "interest_finance")
-    income     = _g(v, "sales_other_income")
-    # No standalone Debtors row in this template - receivables already live
-    # inside Current Assets (see template_config.SYNONYMS).
-    curr_assets = _g(v, "current_assets")
-    curr_liab   = _g(v, "current_liabilities")
-
-    # Long-term debt is BORROWING, not every non-current liability. A deferred
-    # tax liability is an accounting provision that nobody lends and nobody
-    # repays, so it belongs in total outside liabilities but not in gearing or
-    # capital employed - which is how the analyst's own sheets treat it.
-    lt_debt    = (_g(v, "secured_loan_asset_financed")
-                  + _g(v, "unsecured_loans") + _g(v, "other_lt_liabilities"))
-    cap_emp    = networth + lt_debt
-
-    # "(inclusive q/e)" - INCLUSIVE OF QUASI-EQUITY. Unsecured loans (from the
-    # proprietor, partners, directors, relatives) are treated as the owners'
-    # own money for the two gearing ratios: added to net worth, taken out of
-    # debt. Reproduces the analyst's reference sheet exactly (Borrower L
-    # FY2024: 304.74 / (269.24 + 3.00) = 1.119 and (665.47 - 272.24) /
-    # 272.24 = 1.444); the old plain-networth version read 1.143 / 1.472 for
-    # every borrower carrying unsecured loans. Capital employed is unchanged
-    # (unsecured loans sit in it once, whichever side they are counted on).
-    quasi      = _g(v, "unsecured_loans")
-    tnw_qe     = networth + quasi
-    lt_debt_qe = lt_debt - quasi
-    # Total outside liabilities is everything that is not the owners' own
-    # money. Derived by subtraction rather than by adding named rows: summing
-    # the rows omits whichever bucket a given filing happens to use (a deferred
-    # tax liability was being left out), and the answer must not depend on
-    # which row a liability lands in.
-    total_debt_qe = _g(v, "total_liabilities") - tnw_qe
+    pat      = _g(v, "profit_after_tax")
+    pbt      = _g(v, "profit_before_tax")
+    interest = _g(v, "interest_finance")
+    dep      = _g(v, "depreciation")
+    income   = _g(v, "sales_other_income")
+    sec_af   = _g(v, "secured_loan_asset_financed")
+    mat_1yr  = _g(v, "secured_loan_maturity_1yr")
+    unsec    = _g(v, "unsecured_loans")
+    equity   = (_g(v, "equity_capital") + _g(v, "reserves")
+                + _g(v, "preference_shares"))
+    equity_qe = equity + unsec
+    # SUM(Secured loan - Asset Financed : Current Liabilities) on the sheet -
+    # every outside liability row, including Sundry Creditors.
+    outside = sum(_g(v, k) for k in (
+        "secured_loan_asset_financed", "secured_loan_maturity_1yr",
+        "secured_loan_ccod", "other_lt_liabilities", "unsecured_loans",
+        "deferred_tax_liability", "sundry_creditors", "current_liabilities"))
+    curr_assets = _g(v, "debtors") + _g(v, "current_assets")
+    curr_liab   = (_g(v, "sundry_creditors") + _g(v, "current_liabilities")
+                   + _g(v, "secured_loan_ccod") + mat_1yr)
 
     return {
-        "Return on Capital Employed":              _div(pbt + interest, cap_emp),
-        "Return On Share Holders Fund":            _div(pat, networth),
-        "PAT / Income (%) (PAT Margin)":           _div(pat, income),
+        "Return on Capital Employed":              _div(pat + interest, equity + sec_af + unsec),
+        "Return On Share Holders Fund":            _div(pat, equity),
+        "PAT / Income (%)":                        _div(pat, income),
         "PAT / Assets employed (%)":               _div(pat, _g(v, "total_assets")),
-        "Long Term Debt / Equity (inclusive q/e)": _div(lt_debt_qe, tnw_qe),
-        "Total Debt / Equity(inclusive q/e)":      _div(total_debt_qe, tnw_qe),
-        "Interest Coverage":                       _div(pbt + interest + _g(v, "depreciation"),
-                                                       interest),
+        "Long Term Debt / Equity (inclusive q/e)": _div(sec_af + mat_1yr, equity_qe),
+        "Total Debt / Equity(inclusive q/e)":      _div(outside - unsec, equity_qe),
+        "Interest Coverage":                       _div(pbt + interest + dep, interest),
         "Current Ratio":                           _div(curr_assets, curr_liab),
+        "DSCR":                                    _div(pat + dep + interest,
+                                                        interest + sec_af / 4),
+        "Debtor Days":                             (None if not income
+                                                    else _g(v, "debtors") / income * 365),
+        "Creditor Days":                           (None if not income
+                                                    else _g(v, "sundry_creditors") / income * 365),
     }

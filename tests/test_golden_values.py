@@ -80,10 +80,12 @@ KNOWN_DIVERGENCES = {
         # working-capital line) is spread as Secured loan - CC/OD, not as
         # Asset Financed as the reference sheet has it. Totals agree; these
         # rows and the gearing ratios derived from them differ by design.
+        # 2026-09-12: the master format's Current Ratio divides by CC/OD as
+        # well, so the same decision moves it (5.09 -> 1.55 for FY24).
         "skip_labels": {
             "securedloanassetfinanced", "securedloanslongterm",
             "longtermdebtequityinclusiveqe", "longtermdebtequityincludingqe",
-            "returnoncapitalemployed",
+            "returnoncapitalemployed", "currentratio",
         },
     },
     "Borrower J": {
@@ -151,8 +153,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+# The same row under the older and the master wording.
+_LABEL_ALIASES = {"patincomepatmargin": "patincome"}
+
+
 def _normalize_label(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", s.lower())
+    key = re.sub(r"[^a-z0-9]+", "", s.lower())
+    return _LABEL_ALIASES.get(key, key)
 
 
 def _extract_year(v) -> int | None:
@@ -165,9 +172,25 @@ def _extract_year(v) -> int | None:
     return None
 
 
-def _year_grid(ws, max_scan_row=40, max_col=15):
+def _year_grid(ws, max_scan_row=40, max_col=15, evaluate=False):
     """Find the header row with the most year-parseable cells, then read
-    every labelled row below it into {normalized_label: {year: value}}."""
+    every labelled row below it into {normalized_label: {year: value}}.
+
+    `evaluate` computes our OWN workbook's live formulas (see xlsx_eval) -
+    openpyxl never caches values for a file it just wrote. Reference
+    workbooks are read with data_only=True instead, since Excel cached
+    their values when the analyst saved them."""
+    ev = None
+    if evaluate:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from xlsx_eval import SheetEvaluator
+        ev = SheetEvaluator(ws)
+
+    def _val(r, c):
+        if ev is None:
+            return ws.cell(row=r, column=c).value
+        return ev.value(ws.cell(row=r, column=c).coordinate)
+
     year_row, year_cols = None, {}
     for r in range(1, max_scan_row + 1):
         found = {}
@@ -188,7 +211,7 @@ def _year_grid(ws, max_scan_row=40, max_col=15):
         key = _normalize_label(lab)
         if not key or key in grid:
             continue
-        vals = {y: ws.cell(row=r, column=c).value for c, y in year_cols.items()}
+        vals = {y: _val(r, c) for c, y in year_cols.items()}
         vals = {y: v for y, v in vals.items() if isinstance(v, (int, float))}
         if vals:
             grid[key] = vals
@@ -211,11 +234,20 @@ def test_matches_reference_workbook(path, ref_path):
     data = generate_excel(columns)
 
     import io
-    mine = _year_grid(load_workbook(io.BytesIO(data))["ITR Validation"])
+    mine = _year_grid(load_workbook(io.BytesIO(data))["ITR Validation"], evaluate=True)
 
     ref_wb = load_workbook(ref_path, data_only=True)
     ref_ws = ref_wb["MAIN SHEET"] if "MAIN SHEET" in ref_wb.sheetnames else ref_wb.worksheets[0]
     theirs = _year_grid(ref_ws)
+
+    # Older analyst sheets have no separate Sundry Creditors / Debtors rows -
+    # their Current Liabilities / Current Assets rows include them. Compare
+    # like with like by folding ours back in when the reference lacks the row.
+    for sub, into in (("sundrycreditors", "currentliabilitiesandprovision"),
+                      ("debtorsreceivables", "currentassetsloansandadvances")):
+        if sub not in theirs and sub in mine and into in mine:
+            mine[into] = {y: (v or 0) + (mine[sub].get(y) or 0)
+                          for y, v in mine[into].items()}
 
     mismatches = []
     for label, ref_vals in theirs.items():

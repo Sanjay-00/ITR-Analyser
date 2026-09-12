@@ -18,11 +18,17 @@ Three things live here:
   4. CONVENTIONS - the judgement calls worth telling the analyst about,
      shown in both the UI and the Audit Trail sheet.
 
-This file matches the analyst's own "Borrower K - ITR Validation.xlsx"
-template exactly (confirmed 2026-07-29): no separate Debtors/Receivables
-row - debtors are folded into Current Assets - and Deferred Tax Liability
-keeps its own row rather than being folded into Other Long Term
-Liabilities.
+The sheet is the COMBINED MASTER format (agreed with the user 2026-09-12):
+the union of the analysts' two reference layouts, "Format.xlsx" and
+"Validation Format- check.xlsx". Every row either has - all eight expense
+rows, separate Sundry Creditors and Debtors / Receivables rows, Debtor and
+Creditor Days, and the DSCR Calculation block - so the output is always the
+same shape, with 0 in any row a borrower's accounts do not use. Tax is
+entered POSITIVE and subtracted (PAT = PBT - tax - deferred tax), as in
+"Validation Format- check" and the analysts' filled sheets. Totals, ratios,
+DSCR and the Financial Snap are LIVE Excel formulas, defined once below
+(TOTAL_FORMULAS, RATIOS, SNAP, SNAP_RATIO_NAMES) with `{key}` placeholders
+that excel_generator resolves to cell addresses.
 """
 
 import re
@@ -45,14 +51,14 @@ BS_LIABILITY = [
     "equity_capital", "preference_shares", "reserves",
     "secured_loan_asset_financed", "secured_loan_maturity_1yr",
     "secured_loan_ccod", "other_lt_liabilities", "unsecured_loans",
-    "deferred_tax_liability", "current_liabilities",
+    "deferred_tax_liability", "sundry_creditors", "current_liabilities",
 ]
-# No standalone Debtors/Receivables bucket: the analyst's own template does
-# not carry that row, so trade receivables are folded straight into Current
-# Assets by the SYNONYMS rules below.
+# Trade receivables and trade payables have rows of their own in the master
+# format (for Debtor and Creditor Days); "Current assets" / "Current
+# Liabilities and Provision" hold everything else current.
 BS_ASSET = [
     "fixed_assets", "intangible_assets", "investments", "deferred_tax_assets",
-    "current_assets", "lt_loans_advances", "other_non_current_assets",
+    "debtors", "current_assets", "lt_loans_advances", "other_non_current_assets",
 ]
 
 MAPPABLE = PL_INCOME + PL_EXPENSE + PL_TAX + BS_LIABILITY + BS_ASSET
@@ -60,7 +66,7 @@ MAPPABLE = PL_INCOME + PL_EXPENSE + PL_TAX + BS_LIABILITY + BS_ASSET
 DERIVED = [
     "gross_receipts", "gross_expenses", "profit_before_tax", "profit_after_tax",
     "profit_available", "cash_profit", "total_liabilities", "total_assets",
-    "networth",
+    "networth", "total_current_liabilities", "total_current_assets",
 ]
 
 # Display names, in sheet order. Mirrors the analyst's existing workbook so
@@ -93,17 +99,22 @@ LABELS = {
     "other_lt_liabilities":        "Other Long term liabilities",
     "unsecured_loans":             "Unsecured loans",
     "deferred_tax_liability":      "Deffered tax liability",
+    "sundry_creditors":            "Sundry Creditors",
     "current_liabilities":         "Current Liabilities and Provision",
     "total_liabilities":           "Total of Liabilities",
     "fixed_assets":                "Fixed Assets",
     "intangible_assets":           "Intangible Assets",
     "investments":                 "Investments",
     "deferred_tax_assets":         "Deffered Tax Assets",
+    "debtors":                     "Debtors / Receivables",
     "current_assets":              "Current assets, Loans and Advances",
     "lt_loans_advances":           "Long Term Loan & Advance",
     "other_non_current_assets":    "Other Non Current Assets",
     "total_assets":                "Total of Assets",
     "networth":                    "Networth",
+    # Not sheet rows - used by the Analysis tab.
+    "total_current_liabilities":   "Current Liabilities incl. Sundry Creditors",
+    "total_current_assets":        "Current Assets incl. Debtors",
 }
 
 # ─────────────────────────────────────────────────────────────────
@@ -119,7 +130,7 @@ ROWS = [
     ("section", "",                            "PROFIT AND LOSS ACCOUNT"),
     ("section", "",                            "Income"),
     ("item",  "sales_other_income",            None),
-    ("item",  "gross_receipts",                None),
+    ("total", "gross_receipts",                None),
     ("section", "",                            "Expenses"),
     ("item",  "purchases",                     None),
     ("item",  "transport_admin",               None),
@@ -136,7 +147,7 @@ ROWS = [
     ("item",  "provision_deferred_tax",        None),
     ("total", "profit_after_tax",              None),
     ("item",  "preference_dividend",           None),
-    ("item",  "profit_available",              None),
+    ("total", "profit_available",              None),
     ("total", "cash_profit",                   None),
 
     ("section", "",                            "BALANCE SHEET"),
@@ -150,6 +161,7 @@ ROWS = [
     ("item",  "other_lt_liabilities",          None),
     ("item",  "unsecured_loans",               None),
     ("item",  "deferred_tax_liability",        None),
+    ("item",  "sundry_creditors",              None),
     ("item",  "current_liabilities",           None),
     ("total", "total_liabilities",             None),
     ("section", "",                            "Assets"),
@@ -157,58 +169,101 @@ ROWS = [
     ("item",  "intangible_assets",             None),
     ("item",  "investments",                   None),
     ("item",  "deferred_tax_assets",           None),
+    ("item",  "debtors",                       None),
     ("item",  "current_assets",                None),
     ("item",  "lt_loans_advances",             None),
     ("item",  "other_non_current_assets",      None),
     ("total", "total_assets",                  None),
 ]
 
-SNAP_ROWS = [
-    "sales_other_income", "profit_after_tax", "cash_profit", "networth",
-    "secured_loan_asset_financed", "secured_loan_ccod", "current_liabilities",
-    "fixed_assets", "current_assets",
-]
+# Rows filled yellow, as in the analysts' sheets.
+HIGHLIGHT = {"gross_receipts", "gross_expenses", "profit_before_tax",
+             "total_liabilities", "total_assets"}
 
-SNAP_LABELS = {
-    "sales_other_income":          "Turnover and Other Income",
-    "profit_after_tax":            "PAT",
-    "secured_loan_asset_financed": "Secured Loans - Long Term",
-    "secured_loan_ccod":           "Secured Loans - CC / OD",
-    "current_liabilities":         "Current Liabilities and Provisions",
-    "current_assets":              "Current Assets , ST Loans & Advances",
+# ─────────────────────────────────────────────────────────────────
+# LIVE FORMULAS
+# ─────────────────────────────────────────────────────────────────
+# `{key}` is replaced by that row's cell in the same year column. Written
+# exactly as the analysts' sheets write them; taxonomy.ratios() computes the
+# same figures in Python for the app, and tests/test_master_excel.py checks
+# the two agree by EVALUATING these strings.
+
+TOTAL_FORMULAS = {
+    "gross_receipts":    "IFERROR(SUM({sales_other_income}:{sales_other_income}),0)",
+    "gross_expenses":    "IFERROR(SUM({purchases}:{extraordinary}),0)",
+    "profit_before_tax": "IFERROR({gross_receipts}-{gross_expenses},0)",
+    # Tax entered positive, subtracted ("Validation Format- check").
+    "profit_after_tax":  "{profit_before_tax}-{provision_tax}-{provision_deferred_tax}",
+    # As both reference sheets write it; the dividend is entered negative.
+    "profit_available":  "{profit_after_tax}+{preference_dividend}",
+    "cash_profit":       "IFERROR({profit_available}+{depreciation},0)",
+    "total_liabilities": "SUM({equity_capital}:{current_liabilities})",
+    "total_assets":      "SUM({fixed_assets}:{other_non_current_assets})",
 }
 
-# Ratio row order for the main RATIOS block. "DSCR" is not computed here -
-# it is a live formula pointing at the DSCR Calculation block further down
-# the same sheet (see excel_generator._build_sheet), because it depends on
-# the analyst's own EMI entry, not on anything in the accounts.
-RATIO_NAMES = [
-    "Return on Capital Employed",
-    "Return On Share Holders Fund",
-    "PAT / Income (%) (PAT Margin)",
-    "PAT / Assets employed (%)",
-    "Long Term Debt / Equity (inclusive q/e)",
-    "Total Debt / Equity(inclusive q/e)",
-    "Interest Coverage",
-    "Current Ratio",
-]
+_EQUITY_QE = "({equity_capital}+{reserves}+{unsecured_loans}+{preference_shares})"
 
-# Financial Snap carries its own condensed ratios sub-block, under its own
-# labels - the same underlying figures as RATIO_NAMES above, just a shorter
-# list and renamed to match the analyst's Financial Snap sheet exactly.
-# (display label, source ratio name). The source name must be a key
-# taxonomy.ratios() returns, OR the sentinel "DSCR" - which, like the main
-# RATIOS block's own DSCR row, is not computed in taxonomy.ratios() at all
-# and is instead a live link to the DSCR Calculation block (see
-# excel_generator._link_dscr_row).
+# (label, formula, number format). Order is the sheet's.
+RATIOS = [
+    ("Return on Capital Employed",
+     "IFERROR(({profit_after_tax}+{interest_finance})/({equity_capital}+{reserves}"
+     "+{secured_loan_asset_financed}+{unsecured_loans}+{preference_shares}),0)", "0.00%"),
+    ("Return On Share Holders Fund",
+     "IFERROR({profit_after_tax}/({equity_capital}+{reserves}+{preference_shares}),0)", "0.00%"),
+    ("PAT / Income (%)",
+     "IFERROR({profit_after_tax}/{gross_receipts},0)", "0.00%"),
+    ("PAT / Assets employed (%)",
+     "IFERROR({profit_after_tax}/{total_assets},0)", "0.00%"),
+    # "(inclusive q/e)": unsecured loans count as the owners' money.
+    ("Long Term Debt / Equity (inclusive q/e)",
+     "IFERROR(({secured_loan_asset_financed}+{secured_loan_maturity_1yr})/" + _EQUITY_QE + ",0)",
+     "0.00"),
+    ("Total Debt / Equity(inclusive q/e)",
+     "IFERROR((SUM({secured_loan_asset_financed}:{current_liabilities})-{unsecured_loans})/"
+     + _EQUITY_QE + ",0)", "0.00"),
+    ("Interest Coverage",
+     "IFERROR(({profit_before_tax}+{interest_finance}+{depreciation})/{interest_finance},0)", "0.00"),
+    # Debtors and creditors are current items on their own rows here.
+    ("Current Ratio",
+     "IFERROR(({debtors}+{current_assets})/({sundry_creditors}+{current_liabilities}"
+     "+{secured_loan_ccod}+{secured_loan_maturity_1yr}),0)", "0.00"),
+    ("DSCR",
+     "IFERROR(({profit_after_tax}+{depreciation}+{interest_finance})/"
+     "({interest_finance}+({secured_loan_asset_financed}/4)),0)", "0.00"),
+    ("Debtor Days",   "IFERROR({debtors}/{gross_receipts}*365,0)", "0.00"),
+    ("Creditor Days", "IFERROR({sundry_creditors}/{gross_receipts}*365,0)", "0.00"),
+]
+RATIO_NAMES = [name for name, _f, _fmt in RATIOS]
+
+# Financial Snap: (label, formula) - amounts, then its own ratio sub-block.
+SNAP = [
+    ("Turnover and Other Income",           "{gross_receipts}"),
+    ("PAT",                                 "{profit_after_tax}"),
+    ("Cash Profit",                         "{cash_profit}"),
+    ("Networth",                            "{equity_capital}+{preference_shares}+{reserves}"),
+    ("Secured Loans - Long Term",           "{secured_loan_asset_financed}+{secured_loan_maturity_1yr}"),
+    ("Secured Loans – CC / OD",             "{secured_loan_ccod}"),
+    ("Current Liabilities and Provisions",
+     "IFERROR({sundry_creditors}+{current_liabilities}+{secured_loan_maturity_1yr},0)"),
+    ("Fixed Assets",                        "{fixed_assets}"),
+    ("Current Assets , ST Loans & Advances ", "{debtors}+{current_assets}"),
+]
+# (display label, RATIOS name it repeats).
 SNAP_RATIO_NAMES = [
-    ("PAT/Income  (%)",                         "PAT / Income (%) (PAT Margin)"),
+    ("PAT/Income  (%)",                         "PAT / Income (%)"),
     ("Long Term Debt / Equity (including Q/E)", "Long Term Debt / Equity (inclusive q/e)"),
     ("TOL/TNW (including Q/E)",                 "Total Debt / Equity(inclusive q/e)"),
     ("Interest Coverage",                       "Interest Coverage"),
     ("Current Ratio",                           "Current Ratio"),
     ("DSCR",                                    "DSCR"),
+    ("Debtor Days",                             "Debtor Days"),
+    ("Creditor Days",                           "Creditor Days"),
 ]
+
+# DSCR Calculation: the analyst keys the EMIs; everything else is linked.
+# "Yearly Obligation (B)" multiplies the proposed EMI by 4 in an audited
+# column and by 1 in a provisional one, as in "Format.xlsx".
+DSCR_PROPOSED_MULTIPLIER = {"Audited": 4, "Provisional": 1}
 
 # ─────────────────────────────────────────────────────────────────
 # SYNONYMS
@@ -263,11 +318,14 @@ SYNONYMS = [
     # either moves real money between the two halves of the balance sheet.
     ("current_liabilities",         r"short[\s-]*term\s+borrowing"),
     ("current_assets",              r"short[\s-]*term\s+loans?\s*(?:&|and)?\s*advance"),
-    # Trade receivables / sundry debtors fold straight into Current Assets -
-    # the analyst's own template has no separate Debtors row. This must come
-    # before the [CL]/[CA] section-context rules below so it isn't shadowed.
-    ("current_assets",              r"trade\s+receivable|sundry\s+debtor|"
+    # Trade receivables and trade payables have rows of their own in the
+    # master format. Both must come before the [CL]/[CA] section-context rules
+    # below, or "[CL] Sundry Creditors" would be claimed by the section.
+    ("debtors",                     r"trade\s+receivable|sundry\s+debtor|"
                                     r"\bdebtors?\b|bills?\s+receivable"),
+    ("sundry_creditors",            r"sundry\s+creditor|trade\s+payable|sundry\s+payable|"
+                                    r"\bcreditors?\b|outstanding\s+dues\s+of\s+(?:micro|creditors)|"
+                                    r"micro\s+and\s+small\s+enterprise"),
     # Section context from the statement's own group headings (see
     # financials._SECTIONS). Anything printed under "Current Liabilities" or
     # "Current Assets" belongs to that bucket whatever the CA called the line -
@@ -402,7 +460,7 @@ SYNONYMS = [
                                     r"cars?|trucks?|truek|motor|tempo|lorry|"
                                     r"air\s*-?\s*condi?tione?rs?|household\s+appliances?|"
                                     r"printers?|machinery|equipments?)\b"),
-    ("current_assets",              r"trade\s+receivable|sundry\s+debtor|"
+    ("debtors",                     r"trade\s+receivable|sundry\s+debtor|"
                                     r"\bdebtors?\b|bills?\s+receivable"),
     ("other_non_current_assets",    r"other\s+non[\s-]*current\s+asset|"
                                     r"non[\s-]*current\s+asset"),
@@ -501,8 +559,4 @@ CONVENTIONS = [
     (re.compile(r"^\[CA\]", re.I),
      "Classified as a Current Asset from the statement's own section heading, "
      "not from the line's wording"),
-    (re.compile(r"trade\s+receivable|sundry\s+debtor|\bdebtors?\b|"
-               r"bills?\s+receivable", re.I),
-     "Debtors/receivables have no row of their own in this template - folded "
-     "into Current assets, Loans and Advances"),
 ]

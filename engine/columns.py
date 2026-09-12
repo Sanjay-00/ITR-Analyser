@@ -542,6 +542,10 @@ def spread_document(source, extract_fn, api_key: str = None,
 
     return {
         "year":           _fy_end_year(usable, identity),
+        # "PROV. BALANCE SHEET", "Provisional P&L" - the sheet's column
+        # heading then says "Provisional" instead of "Audited".
+        "provisional":    any(re.search(r"\bprov(?:isional)?\b\.?", b.get("title") or "", re.I)
+                              for b in usable),
         "entity":         entity,
         "identity":       identity,
         "scanned":        scanned,

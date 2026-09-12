@@ -37,7 +37,7 @@ THRESHOLDS = {
 TREND_KEYS = [
     "sales_other_income", "gross_expenses", "profit_before_tax",
     "profit_after_tax", "cash_profit", "networth", "total_assets",
-    "current_liabilities",
+    "total_current_liabilities",
 ]
 
 
@@ -151,8 +151,8 @@ def flags(columns: list) -> list:
             _flag(out, col, AMBER, "Turnover falling",
                   f"Revenue down {abs(g):.0%} year on year")
 
-        m0 = (prev.get("ratios") or {}).get("PAT / Income (%) (PAT Margin)")
-        m1 = r.get("PAT / Income (%) (PAT Margin)")
+        m0 = (prev.get("ratios") or {}).get("PAT / Income (%)")
+        m1 = r.get("PAT / Income (%)")
         if m0 is not None and m1 is not None and m0 - m1 >= th["margin_drop_pts"]:
             _flag(out, col, AMBER, "Margin compressing",
                   f"PAT margin {m0:.1%} -> {m1:.1%}")
@@ -167,7 +167,9 @@ def flags(columns: list) -> list:
                   f"Outside liabilities up {gd:.0%} against revenue "
                   f"{'up' if g >= 0 else 'down'} {abs(g):.0%}")
 
-        cl0, cl1 = pv.get("current_liabilities"), v.get("current_liabilities")
+        # Payables = Sundry Creditors + other Current Liabilities; the master
+        # format keeps creditors on a row of their own.
+        cl0, cl1 = pv.get("total_current_liabilities"), v.get("total_current_liabilities")
         gcl = _growth(cl0, cl1)
         if gcl is not None and g is not None and gcl > 0.5 and gcl - g > 0.4:
             _flag(out, col, AMBER, "Payables stretching",

@@ -1,13 +1,22 @@
 """
-excel_generator.py  -  the ITR Validation spreading sheet.
+excel_generator.py  -  the ITR Validation spreading sheet, in the combined
+master format (see template_config's docstring).
 
-Reproduces the analyst's existing workbook: Profit & Loss, Balance Sheet,
-Ratios, a DSCR working and a Financial Snap, one column per financial year,
-amounts in lakhs. A second sheet carries the audit trail - which statement fed
-each column, whether it reconciled, and any label the mapping could not place.
+Sheet 1, "ITR Validation", is the analyst's own layout and nothing else:
+Profit & Loss, Balance Sheet, Ratios, DSCR Calculation and Financial Snap,
+one column per financial year, amounts in lakhs. Only the figures read from
+the accounts are written as values; every total, profit line, ratio and
+Snap figure is a LIVE Excel formula (template_config.TOTAL_FORMULAS / RATIOS
+/ SNAP), so the analyst can correct one input and everything recomputes.
 
-Figures are written in lakhs as REAL NUMBERS, not strings, so the sheet stays
-sortable and chartable and the analyst can keep working in it.
+A row the accounts do not use shows 0. A row that could not be READ (that
+year's P&L or Balance Sheet did not reconcile) also shows 0 - so every
+formula still works - but is filled red with a note, because "the business
+has no income" and "we could not read its income" must never look alike.
+
+Sheet 2, "Analysis", carries year-on-year trends and red/amber flags; sheet
+3, "Audit Trail", where every figure came from and what could not be
+verified.
 """
 
 import io
@@ -15,6 +24,7 @@ import re
 import datetime
 
 from openpyxl import Workbook
+from openpyxl.comments import Comment
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
@@ -24,19 +34,32 @@ from .mapping import taxonomy as T
 from .mapping import template_config as C
 
 # ─────────────────────────────────────────────
-# PALETTE
+# PALETTE AND FORMATS  (matched to the analysts' reference sheets)
 # ─────────────────────────────────────────────
 
 NAVY       = "1F3864"
 WHITE      = "FFFFFF"
-SECTION_BG = "D6E4F0"
-TOTAL_BG   = "FFF2CC"
-BORDER_CLR = "BFBFBF"
+HEAD_BG    = "DDEBF7"     # header rows and the RATIOS block
+SECTION_BG = "D6E4F0"     # Analysis / Audit Trail section bands
+TOTAL_BG   = "FFFF00"     # the analysts' yellow totals
+UNREAD_BG  = "FFC7CE"     # a figure that could not be read from the ITR
+BORDER_CLR = "808080"
 GOOD_GREEN = "375623"
 BAD_RED    = "C00000"
 WARN_BG    = "FFF2F2"
 
+AMT_FMT  = "0.00"
+DATE_FMT = "[$-409]d\\-mmm\\-yy;@"
+PCT_FMT  = "0.0%;-0.0%;0.0%"
+
 LAKH = 100000.0
+
+ROWS      = C.ROWS
+SNAP_ROWS = [label for label, _f in C.SNAP]
+
+UNREAD_NOTE = ("Not read from the ITR - this year's statement did not "
+               "reconcile, so 0 is a placeholder. Please verify and enter "
+               "the figure.")
 
 
 def _b(style="thin"):
@@ -56,22 +79,14 @@ def _a(h="left", v="center", wrap=False, indent=0):
     return Alignment(horizontal=h, vertical=v, wrap_text=wrap, indent=indent)
 
 
-LAKH_FMT  = "#,##0.00;-#,##0.00;0"
-RATIO_FMT = "0.00;-0.00;0.00"
-DAYS_FMT  = "0.0"
+def _formula(template: str, refs: dict) -> str:
+    """'{gross_receipts}-{gross_expenses}' -> '=B7-B17' for one column."""
+    return "=" + re.sub(r"\{(\w+)\}", lambda m: refs[m.group(1)], template)
 
 
 # ─────────────────────────────────────────────
-# SHEET LAYOUT
+# ENTRY POINTS
 # ─────────────────────────────────────────────
-# The row schema, labels and taxonomy-bucket catalogues all live in
-# template_config.py now - the one file to edit when the analyst's template
-# changes shape or a line item should be bucketed differently.
-
-ROWS        = C.ROWS
-SNAP_ROWS   = C.SNAP_ROWS
-SNAP_LABELS = C.SNAP_LABELS
-
 
 def borrower_name(columns: list) -> str:
     """
@@ -92,7 +107,7 @@ def borrower_name(columns: list) -> str:
 
 
 def generate_excel(columns: list) -> bytes:
-    """`columns` is spread.spread_many()'s output, oldest year first."""
+    """`columns` is columns.spread_many()'s output, oldest year first."""
     wb = Workbook()
     _build_sheet(wb, columns)
     _build_analysis_sheet(wb, columns)
@@ -102,316 +117,202 @@ def generate_excel(columns: list) -> bytes:
     return buf.getvalue()
 
 
+def _status(col: dict) -> str:
+    return "Provisional" if col.get("provisional") else "Audited"
+
+
 def _col_header(col: dict) -> str:
     y = col.get("year")
     return f"31-03-{y}" if y else (col.get("source_name") or "Unknown year")
 
 
-# Shown where a statement could not be read at all. Deliberately NOT "-" or 0:
-# an analyst must be able to tell "the accounts say nil" from "we could not
-# read this - go and look at the ITR yourself".
-UNREAD = "Check ITR"
+# ─────────────────────────────────────────────
+# SHEET 1 - ITR VALIDATION (the master format)
+# ─────────────────────────────────────────────
 
-
-def _write_value(ws, row, c, value, kind):
-    cell = ws.cell(row=row, column=c)
-    if value is None:
-        cell.value     = UNREAD
-        cell.font      = _f(italic=True, color=BAD_RED)
-        cell.fill      = _fill(WARN_BG)
-        cell.alignment = _a(h="right")
-        cell.border    = _b()
-        return cell
-    else:
-        cell.value = value / LAKH
-        cell.number_format = LAKH_FMT
-        cell.alignment = _a(h="right")
-    cell.font   = _f(bold=(kind == "total"))
-    cell.border = _b()
-    if kind == "total":
-        cell.fill = _fill(TOTAL_BG)
-    return cell
-
-
-def _write_ratio_row(ws, row, label, columns, ratio_key, bold=False):
-    """
-    One row of a ratios block - the main RATIOS section and the Financial
-    Snap's condensed ratios sub-block both call this, so a formatting change
-    only has to happen once.
-    """
-    lbl = ws.cell(row=row, column=1, value=label)
-    lbl.font, lbl.alignment, lbl.border = _f(bold=bold), _a(indent=1), _b()
-    for i, col in enumerate(columns):
-        v = (col.get("ratios") or {}).get(ratio_key)
-        cell = ws.cell(row=row, column=2 + i)
-        if v is None:
-            # The denominator was zero - no interest to cover, no equity to
-            # gear against. Shown as "n/a" rather than 0, which would read as
-            # a measured value.
-            cell.value, cell.font = "n/a", _f(italic=True, color="808080")
+def _period_header(ws, row: int, title, columns: list, merge_title: bool) -> None:
+    """Two header rows: title | Audited/Provisional..., then (blank) | dates."""
+    n = max(len(columns), 1)
+    t = ws.cell(row=row, column=1, value=title)
+    t.font, t.fill, t.border = _f(bold=True), _fill(HEAD_BG), _b()
+    ws.cell(row=row + 1, column=1).border = _b()
+    ws.cell(row=row + 1, column=1).fill = _fill(HEAD_BG)
+    if merge_title:
+        ws.merge_cells(start_row=row, start_column=1, end_row=row + 1, end_column=1)
+        t.alignment = _a(v="center", wrap=True)
+    for i in range(n):
+        col = columns[i] if i < len(columns) else {}
+        h = ws.cell(row=row, column=2 + i, value=_status(col) if col else "")
+        d = ws.cell(row=row + 1, column=2 + i)
+        if col.get("year"):
+            d.value, d.number_format = datetime.datetime(col["year"], 3, 31), DATE_FMT
         else:
-            cell.value = v
-            cell.number_format = RATIO_FMT
-        cell.alignment, cell.border = _a(h="right"), _b()
+            d.value = col.get("source_name") or ""
+        for c in (h, d):
+            c.font, c.fill, c.alignment, c.border = (_f(bold=True), _fill(HEAD_BG),
+                                                     _a(h="center"), _b())
 
 
-def _reserve_dscr_row(ws, row, label, columns):
-    """
-    "DSCR" appears as a row in both the main RATIOS block and the Financial
-    Snap's ratios sub-block, but it is not in taxonomy.ratios() - it depends
-    on EMI figures no statement carries. Write the label now and leave the
-    values for `_link_dscr_row` once the DSCR Calculation block exists.
-    """
-    lbl = ws.cell(row=row, column=1, value=label)
-    lbl.alignment, lbl.border = _a(indent=1), _b()
-    for i in range(len(columns)):
-        ws.cell(row=row, column=2 + i).border = _b()
+def _label(ws, row, text, bold=False, fill=None):
+    c = ws.cell(row=row, column=1, value=text)
+    c.font, c.border = _f(bold=bold), _b()
+    if fill:
+        c.fill = _fill(fill)
+    return c
 
 
-def _link_dscr_row(ws, row, columns, dscr_calc_row):
-    """Point a DSCR row at the live DSCR Calculation cell for each column."""
-    for i in range(len(columns)):
-        L = get_column_letter(2 + i)
-        cell = ws.cell(row=row, column=2 + i, value=f"={L}{dscr_calc_row}")
-        cell.number_format, cell.font = RATIO_FMT, _f(bold=True)
-        cell.alignment, cell.border = _a(h="right"), _b()
+def _write_input(cell, col: dict, key: str) -> None:
+    """One figure read from the accounts, in lakhs - or a flagged 0."""
+    v = (col.get("values") or {}).get(key)
+    if v is None:
+        cell.value = 0
+        cell.fill = _fill(UNREAD_BG)
+        cell.comment = Comment(UNREAD_NOTE, "ITR Extractor")
+        return
+    if key == "preference_dividend":
+        v = -abs(v)   # the sheet ADDS it: {profit_after_tax}+{preference_dividend}
+    cell.value = v / LAKH
 
 
 def _build_sheet(wb, columns: list) -> None:
     ws = wb.active
     ws.title = "ITR Validation"
-    ws.column_dimensions["A"].width = 42
     n = max(len(columns), 1)
+    ws.column_dimensions["A"].width = 44
     for i in range(n):
-        ws.column_dimensions[get_column_letter(2 + i)].width = 16
-    last = get_column_letter(1 + n)
+        ws.column_dimensions[get_column_letter(2 + i)].width = 15
 
-    entity = borrower_name(columns)
+    title = f"{borrower_name(columns)} (Amt in Lakhs)"
+    _period_header(ws, 2, title, columns, merge_title=True)
+    ws.freeze_panes = "B4"
 
-    row = 1
-    ws.merge_cells(f"A{row}:{last}{row}")
-    t = ws.cell(row=row, column=1, value=f"{entity}  (Amt in Lakhs)")
-    t.font, t.fill, t.alignment = _f(14, True, WHITE), _fill(NAVY), _a(indent=1)
-    ws.row_dimensions[row].height = 26
-    row += 1
-
-    # Period header
-    ws.cell(row=row, column=1, value="Audited").font = _f(bold=True)
-    for i, col in enumerate(columns):
-        c = ws.cell(row=row, column=2 + i, value=_col_header(col))
-        c.font, c.fill, c.alignment = _f(bold=True, color=WHITE), _fill(NAVY), _a(h="center")
-        c.border = _b()
-    ws.row_dimensions[row].height = 20
-    ws.freeze_panes = f"B{row + 1}"
-    row += 1
-
+    # First pass: every keyed row's position, so formulas can refer forward.
+    rowmap, row = {}, 4
     for kind, key, label in ROWS:
         if kind == "blank":
             row += 1
             continue
         if kind == "section":
-            ws.merge_cells(f"A{row}:{last}{row}")
-            c = ws.cell(row=row, column=1, value=label)
-            c.font, c.fill, c.alignment = _f(bold=True, color=NAVY), _fill(SECTION_BG), _a(indent=1)
+            _label(ws, row, label, bold=True)
+            for i in range(n):
+                ws.cell(row=row, column=2 + i).border = _b()
             row += 1
             continue
-
-        lbl = ws.cell(row=row, column=1, value=label or T.LABELS.get(key, key))
-        lbl.font      = _f(bold=(kind == "total"))
-        lbl.alignment = _a(indent=1)
-        lbl.border    = _b()
-        if kind == "total":
-            lbl.fill = _fill(TOTAL_BG)
-        for i, col in enumerate(columns):
-            _write_value(ws, row, 2 + i, col["values"].get(key), kind)
+        rowmap[key] = row
         row += 1
 
-    # ── Ratios ───────────────────────────────────────────────
-    row += 1
-    ws.merge_cells(f"A{row}:{last}{row}")
-    c = ws.cell(row=row, column=1, value="RATIOS")
-    c.font, c.fill, c.alignment = _f(bold=True, color=NAVY), _fill(SECTION_BG), _a(indent=1)
-    row += 1
-
-    names = list(columns[0]["ratios"].keys()) if columns and columns[0]["ratios"] \
-        else list(T.ratios({}).keys())
-    for name in names:
-        _write_ratio_row(ws, row, name, columns, name)
-        row += 1
-
-    # DSCR is reserved here and linked below, once the DSCR Calculation block
-    # (further down this same sheet) exists to point at.
-    dscr_ratio_row = row
-    _reserve_dscr_row(ws, row, "DSCR", columns)
-    row += 1
-
-    # ── DSCR working ─────────────────────────────────────────
-    # Part A (cash available) is derived from the accounts. Part B needs the
-    # borrower's existing and proposed EMI, which appears in no ITR or
-    # financial statement, so those cells are left EMPTY for the analyst
-    # rather than filled with a guess. The DSCR formula is written live, so
-    # the ratio computes itself the moment the EMI is typed in.
-    row += 2
-    ws.merge_cells(f"A{row}:{last}{row}")
-    c = ws.cell(row=row, column=1, value="DSCR Calculation")
-    c.font, c.fill, c.alignment = _f(bold=True, color=NAVY), _fill(SECTION_BG), _a(indent=1)
-    row += 1
-
-    dscr_src = [("Net Profit", "profit_after_tax"),
-                ("Depreciation", "depreciation"),
-                ("Interest (Including CC/OD interest)", "interest_finance")]
-    first_a = row
-    for label, key in dscr_src:
-        lbl = ws.cell(row=row, column=1, value=label)
-        lbl.alignment, lbl.border = _a(indent=1), _b()
-        for i, col in enumerate(columns):
-            _write_value(ws, row, 2 + i, col["values"].get(key), "item")
-        row += 1
-
-    total_a = row
-    lbl = ws.cell(row=row, column=1, value="Total (A)")
-    lbl.font, lbl.alignment, lbl.border = _f(bold=True), _a(indent=1), _b()
-    for i in range(len(columns)):
+    def refs_for(i):
         L = get_column_letter(2 + i)
-        cell = ws.cell(row=row, column=2 + i,
-                       value=f"=SUM({L}{first_a}:{L}{total_a - 1})")
-        cell.number_format, cell.font = LAKH_FMT, _f(bold=True)
-        cell.fill, cell.alignment, cell.border = _fill(TOTAL_BG), _a(h="right"), _b()
-    row += 1
+        return {k: f"{L}{r}" for k, r in rowmap.items()}
 
-    emi_rows = {}
-    for label in ("Existing Monthly EMI", "Proposed Loan EMI"):
-        lbl = ws.cell(row=row, column=1, value=label)
-        lbl.alignment, lbl.border = _a(indent=1), _b()
+    # Second pass: the P&L and Balance Sheet rows.
+    for kind, key, label in ROWS:
+        if kind not in ("item", "total"):
+            continue
+        r = rowmap[key]
+        hl = TOTAL_BG if key in C.HIGHLIGHT else None
+        _label(ws, r, label or C.LABELS.get(key, key), bold=(kind == "total"), fill=hl)
+        for i, col in enumerate(columns):
+            cell = ws.cell(row=r, column=2 + i)
+            if key in C.TOTAL_FORMULAS:
+                cell.value = _formula(C.TOTAL_FORMULAS[key], refs_for(i))
+            else:
+                _write_input(cell, col, key)
+            cell.number_format, cell.alignment, cell.border = AMT_FMT, _a(h="center"), _b()
+            cell.font = _f(size=11)
+            if hl:
+                cell.fill = _fill(hl)
+
+    # RATIOS - live formulas.
+    r = row
+    _label(ws, r, "RATIOS", bold=True, fill=HEAD_BG)
+    for i in range(n):
+        ws.cell(row=r, column=2 + i).border = _b()
+    r += 1
+    ratio_rows = {}
+    for name, tmpl, fmt in C.RATIOS:
+        _label(ws, r, name, fill=HEAD_BG)
         for i in range(len(columns)):
-            cell = ws.cell(row=row, column=2 + i)
-            cell.number_format = LAKH_FMT
-            cell.fill, cell.alignment, cell.border = _fill(WARN_BG), _a(h="right"), _b()
-        emi_rows[label] = row
-        row += 1
+            c = ws.cell(row=r, column=2 + i, value=_formula(tmpl, refs_for(i)))
+            c.number_format, c.alignment, c.border, c.font = fmt, _a(h="center"), _b(), _f(size=11)
+        ratio_rows[name] = r
+        r += 1
 
-    total_b = row
-    lbl = ws.cell(row=row, column=1, value="Yearly Obligation (B)")
-    lbl.font, lbl.alignment, lbl.border = _f(bold=True), _a(indent=1), _b()
-    e, p = emi_rows["Existing Monthly EMI"], emi_rows["Proposed Loan EMI"]
+    # DSCR Calculation - linked to the sheet; the analyst keys the EMIs.
+    r += 1
+    _period_header(ws, r, "DSCR Calculation", columns, merge_title=False)
+    ws.cell(row=r + 1, column=1, value="Particular").font = _f(bold=True)
+    r += 2
+    first = r
+    for label, key in (("Net Profit", "profit_after_tax"), ("Depreciation", "depreciation"),
+                       ("Interest (Including CC/OD interest)", "interest_finance")):
+        _label(ws, r, label)
+        for i in range(len(columns)):
+            c = ws.cell(row=r, column=2 + i, value=f"={refs_for(i)[key]}")
+            c.number_format, c.alignment, c.border = AMT_FMT, _a(h="center"), _b()
+        r += 1
+    total_a = r
+    _label(ws, r, "Total (A)", bold=True)
     for i in range(len(columns)):
         L = get_column_letter(2 + i)
-        cell = ws.cell(row=row, column=2 + i, value=f"=({L}{e}+{L}{p})*12")
-        cell.number_format, cell.font = LAKH_FMT, _f(bold=True)
-        cell.fill, cell.alignment, cell.border = _fill(TOTAL_BG), _a(h="right"), _b()
-    row += 1
-
-    lbl = ws.cell(row=row, column=1, value="DSCR (A/B)")
-    lbl.font, lbl.alignment, lbl.border = _f(bold=True), _a(indent=1), _b()
-    dscr_calc_row = row
+        c = ws.cell(row=r, column=2 + i, value=f"=SUM({L}{first}:{L}{r - 1})")
+        c.number_format, c.alignment, c.border, c.font = AMT_FMT, _a(h="center"), _b(), _f(bold=True)
+    r += 1
+    emi, proposed = r, r + 1
+    for label in ("Existing Monthly EMI", "Proposed Loan EMI"):
+        _label(ws, r, label)
+        for i in range(len(columns)):
+            c = ws.cell(row=r, column=2 + i)
+            c.number_format, c.alignment, c.border = AMT_FMT, _a(h="center"), _b()
+            c.fill = _fill(WARN_BG)   # the analyst's own input
+        r += 1
+    oblig = r
+    _label(ws, r, "Yearly Obligation (B)")
+    for i, col in enumerate(columns):
+        L = get_column_letter(2 + i)
+        m = C.DSCR_PROPOSED_MULTIPLIER[_status(col)]
+        c = ws.cell(row=r, column=2 + i, value=f"=SUM({L}{emi}*12+{L}{proposed}*{m})")
+        c.number_format, c.alignment, c.border = AMT_FMT, _a(h="center"), _b()
+    r += 1
+    total_b = r
+    _label(ws, r, "Total (B)", bold=True)
     for i in range(len(columns)):
         L = get_column_letter(2 + i)
-        cell = ws.cell(row=row, column=2 + i,
-                       value=f'=IF({L}{total_b}=0,"",{L}{total_a}/{L}{total_b})')
-        cell.number_format, cell.font = RATIO_FMT, _f(bold=True)
-        cell.alignment, cell.border = _a(h="right"), _b()
-    row += 1
+        c = ws.cell(row=r, column=2 + i, value=f"={L}{oblig}")
+        c.number_format, c.alignment, c.border, c.font = AMT_FMT, _a(h="center"), _b(), _f(bold=True)
+    r += 1
+    _label(ws, r, "DSCR (A/B)", bold=True)
+    for i in range(len(columns)):
+        L = get_column_letter(2 + i)
+        c = ws.cell(row=r, column=2 + i, value=f"=IFERROR({L}{total_a}/{L}{total_b},0)")
+        c.number_format, c.alignment, c.border, c.font = "0.00", _a(h="center"), _b(), _f(bold=True)
+    r += 1
 
-    # Backfill the "DSCR" row reserved earlier in the RATIOS block: a live
-    # link to this same computed cell, so it updates the moment EMI is typed.
-    _link_dscr_row(ws, dscr_ratio_row, columns, dscr_calc_row)
-
-    note = ws.cell(row=row, column=1,
-                   value="Enter monthly EMI in the highlighted cells - DSCR computes automatically")
-    note.font = _f(size=9, italic=True, color="808080")
-    ws.merge_cells(f"A{row}:{last}{row}")
-    row += 1
-
-    # ── Financial snap ───────────────────────────────────────
-    row += 2
-    ws.merge_cells(f"A{row}:{last}{row}")
-    c = ws.cell(row=row, column=1, value="Financial Snap  (Amt in Lakhs)")
-    c.font, c.fill, c.alignment = _f(bold=True, color=WHITE), _fill(NAVY), _a(indent=1)
-    row += 1
-    for key in SNAP_ROWS:
-        lbl = ws.cell(row=row, column=1,
-                      value=SNAP_LABELS.get(key, T.LABELS.get(key, key)))
-        lbl.alignment, lbl.border = _a(indent=1), _b()
-        for i, col in enumerate(columns):
-            _write_value(ws, row, 2 + i, col["values"].get(key), "item")
-        row += 1
-
-    # Financial Snap's own condensed ratios sub-block - same underlying
-    # figures as the main RATIOS block above, under the Financial Snap's own
-    # labels (see template_config.SNAP_RATIO_NAMES).
-    lbl = ws.cell(row=row, column=1, value="Ratios")
-    lbl.font, lbl.alignment, lbl.border = _f(bold=True), _a(indent=1), _b()
-    row += 1
-    for label, ratio_key in C.SNAP_RATIO_NAMES:
-        if ratio_key == "DSCR":
-            _reserve_dscr_row(ws, row, label, columns)
-            _link_dscr_row(ws, row, columns, dscr_calc_row)
-        else:
-            _write_ratio_row(ws, row, label, columns, ratio_key)
-        row += 1
-
-    # ── Extraction status ────────────────────────────────────
-    row += 1
-    ws.merge_cells(f"A{row}:{last}{row}")
-    c = ws.cell(row=row, column=1, value="Extraction Status")
-    c.font, c.fill, c.alignment = _f(bold=True, color=NAVY), _fill(SECTION_BG), _a(indent=1)
-    row += 1
-
-    lbl = ws.cell(row=row, column=1, value="Statements reconciled")
-    lbl.font, lbl.alignment, lbl.border = _f(bold=True), _a(indent=1), _b()
-    for i, col in enumerate(columns):
-        used = col.get("blocks_used") or []
-        ok   = sum(1 for b in used if b["status"] == F.VERIFIED)
-        cell = ws.cell(row=row, column=2 + i, value=f"{ok} of {len(used)}")
-        cell.font = _f(color=GOOD_GREEN if used and ok == len(used) else BAD_RED,
-                       bold=True)
-        cell.alignment, cell.border = _a(h="center"), _b()
-        if not used or ok < len(used):
-            cell.fill = _fill(WARN_BG)
-    row += 1
-
-    lbl = ws.cell(row=row, column=1, value="Pages read / in document")
-    lbl.font, lbl.alignment, lbl.border = _f(bold=True), _a(indent=1), _b()
-    for i, col in enumerate(columns):
-        cell = ws.cell(row=row, column=2 + i,
-                       value=f"{col.get('pages_used', 0)} / {col.get('pages_total', 0)}")
-        cell.alignment, cell.border = _a(h="center"), _b()
-    row += 1
-
-    # Lines that fit no template row are money that is REAL but absent from
-    # every figure above. That has to be visible on the sheet an analyst
-    # actually reads, not only in the audit tab.
-    lbl = ws.cell(row=row, column=1, value="Amount excluded (fits no row)")
-    lbl.font, lbl.alignment, lbl.border = _f(bold=True), _a(indent=1), _b()
-    for i, col in enumerate(columns):
-        excluded = sum(a for _l, a in col.get("unmapped", []))
-        cell = ws.cell(row=row, column=2 + i)
-        cell.value = excluded / LAKH if excluded else 0
-        cell.number_format = LAKH_FMT
-        cell.alignment, cell.border = _a(h="right"), _b()
-        if excluded:
-            cell.font, cell.fill = _f(bold=True, color=BAD_RED), _fill(WARN_BG)
-    row += 1
-
-    lbl = ws.cell(row=row, column=1, value="Assumptions made")
-    lbl.font, lbl.alignment, lbl.border = _f(bold=True), _a(indent=1), _b()
-    for i, col in enumerate(columns):
-        n = len(col.get("assumptions", []))
-        cell = ws.cell(row=row, column=2 + i, value=n)
-        cell.alignment, cell.border = _a(h="center"), _b()
-        if n:
-            cell.font = _f(bold=True, color="9C6500")
-    row += 2
-
-    note = ws.cell(row=row, column=1,
-                   value="See the Audit Trail sheet for every excluded line, "
-                         "every assumption, and which statement each figure came from")
-    note.font = _f(size=9, italic=True, color="808080")
-    ws.merge_cells(f"A{row}:{last}{row}")
+    # Financial Snap - linked to the rows above.
+    r += 2
+    _period_header(ws, r, "=A2", columns, merge_title=True)
+    r += 2
+    for label, tmpl in C.SNAP:
+        _label(ws, r, label)
+        for i in range(len(columns)):
+            c = ws.cell(row=r, column=2 + i, value=_formula(tmpl, refs_for(i)))
+            c.number_format, c.alignment, c.border = AMT_FMT, _a(h="center"), _b()
+        r += 1
+    _label(ws, r, "Ratios", bold=True)
+    r += 1
+    ratio_fmt = {name: fmt for name, _t, fmt in C.RATIOS}
+    for label, source in C.SNAP_RATIO_NAMES:
+        _label(ws, r, label)
+        for i in range(len(columns)):
+            L = get_column_letter(2 + i)
+            c = ws.cell(row=r, column=2 + i, value=f"={L}{ratio_rows[source]}")
+            c.number_format, c.alignment, c.border = ratio_fmt[source], _a(h="center"), _b()
+        r += 1
 
 
-PCT_FMT = "0.0%;-0.0%;0.0%"
-
+# ─────────────────────────────────────────────
+# SHEET 2 - ANALYSIS
+# ─────────────────────────────────────────────
 
 def _build_analysis_sheet(wb, columns: list) -> None:
     """
@@ -420,7 +321,7 @@ def _build_analysis_sheet(wb, columns: list) -> None:
     template row for row.
     """
     ws = wb.create_sheet("Analysis")
-    ws.column_dimensions["A"].width = 42
+    ws.column_dimensions["A"].width = 44
     n = max(len(columns), 1)
     for i in range(n):
         ws.column_dimensions[get_column_letter(2 + i)].width = 16
@@ -481,6 +382,10 @@ def _build_analysis_sheet(wb, columns: list) -> None:
     note.font = _f(size=9, italic=True, color="808080")
 
 
+# ─────────────────────────────────────────────
+# SHEET 3 - AUDIT TRAIL
+# ─────────────────────────────────────────────
+
 def _build_audit_sheet(wb, columns: list) -> None:
     """
     Where every figure came from, and what could not be verified.
@@ -501,11 +406,29 @@ def _build_audit_sheet(wb, columns: list) -> None:
     for col in columns:
         ws.merge_cells(f"A{row}:E{row}")
         c = ws.cell(row=row, column=1,
-                    value=f"{_col_header(col)}  ·  {col.get('entity', '')}  ·  "
+                    value=f"{_col_header(col)}  ·  {_status(col)}  ·  {col.get('entity', '')}  ·  "
                           f"{col.get('source_name', '')}"
                           f"{'  ·  scanned' if col.get('scanned') else ''}")
         c.font, c.fill, c.alignment = _f(bold=True, color=WHITE), _fill(NAVY), _a(indent=1)
         row += 1
+
+        # Extraction status - kept off the main sheet so it stays exactly the
+        # analyst's format.
+        used = col.get("blocks_used") or []
+        ok = sum(1 for b in used if b.get("status") == F.VERIFIED)
+        excluded = sum(a for _l, a in col.get("unmapped", []))
+        for label, value in (
+                ("Statements reconciled", f"{ok} of {len(used)}"),
+                ("Pages read / in document",
+                 f"{col.get('pages_used', 0)} / {col.get('pages_total', 0)}"),
+                ("Amount excluded (fits no row)",
+                 f"{excluded / LAKH:,.2f} lakhs" if excluded else "none"),
+                ("Assumptions made", str(len(col.get("assumptions", []))))):
+            ws.cell(row=row, column=1, value=label).font = _f(bold=True)
+            v = ws.cell(row=row, column=2, value=value)
+            v.font = _f(color=BAD_RED if (label == "Statements reconciled"
+                                          and (not used or ok < len(used))) else "000000")
+            row += 1
 
         pages = col.get("page_summary") or {}
         ws.cell(row=row, column=1, value="Pages").font = _f(bold=True)
@@ -522,11 +445,10 @@ def _build_audit_sheet(wb, columns: list) -> None:
                           + ", ".join(str(p + 1) for p in vp)).font = _f(size=9)
             row += 1
 
-        for head in ("Status", "Statement", "Page", "Total", "Detail"):
-            hc = ws.cell(row=row, column=("Status", "Statement", "Page", "Total",
-                                          "Detail").index(head) + 1, value=head)
-            hc.font, hc.fill = _f(bold=True), _fill(SECTION_BG)
-            hc.border = _b()
+        heads = ("Status", "Statement", "Page", "Total", "Detail")
+        for j, head in enumerate(heads, 1):
+            hc = ws.cell(row=row, column=j, value=head)
+            hc.font, hc.fill, hc.border = _f(bold=True), _fill(SECTION_BG), _b()
         row += 1
 
         for b in col.get("blocks", []):
@@ -546,7 +468,6 @@ def _build_audit_sheet(wb, columns: list) -> None:
                 ws.cell(row=row, column=cc).border = _b()
             row += 1
 
-        # ── Lines that did not fit the template ──────────────
         for label, amount in col.get("unmapped", []):
             ws.cell(row=row, column=1, value="EXCLUDED").font = _f(bold=True, color=BAD_RED)
             ws.cell(row=row, column=2, value=label[:60]).font = _f(size=9)
@@ -555,12 +476,11 @@ def _build_audit_sheet(wb, columns: list) -> None:
             a.fill = _fill(WARN_BG)
             ws.cell(row=row, column=5,
                     value="fits no row in this template - NOT included in any "
-                          "figure above").font = _f(size=9, color=BAD_RED)
+                          "figure").font = _f(size=9, color=BAD_RED)
             for cc in range(1, 6):
                 ws.cell(row=row, column=cc).border = _b()
             row += 1
 
-        # ── Judgement calls ──────────────────────────────────
         for note in col.get("assumptions", []):
             ws.cell(row=row, column=1, value="ASSUMED").font = _f(bold=True, color="9C6500")
             ws.cell(row=row, column=2, value=str(note["label"])[:60]).font = _f(size=9)
@@ -573,7 +493,6 @@ def _build_audit_sheet(wb, columns: list) -> None:
                 ws.cell(row=row, column=cc).border = _b()
             row += 1
 
-        # ── Subtotal rows deliberately not counted ───────────
         ignored = col.get("ignored", [])
         if ignored:
             ws.cell(row=row, column=1, value="not counted").font = _f(bold=True, color="808080")

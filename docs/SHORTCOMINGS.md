@@ -808,6 +808,35 @@ page's own text and coordinates.
   read as the decimal. **Still open:** the same year's P&L fails on a
   deferred-tax sign in the tax section.
 
+### 25. Output switched to the combined master format — 2026-09-12
+
+The user supplied two analyst layouts (`Format.xlsx`, `Validation Format-
+check.xlsx`) that disagreed: expense rows, whether Sundry Creditors and
+Debtors had rows of their own, Debtor/Creditor Days, the DSCR block, and the
+sign of tax (`=PBT+tax` vs `=PBT-tax`). Agreed with the user: one combined
+master format holding every row of both, tax entered positive and subtracted
+(two of the three sheets seen do it that way), figures in plain lakhs, all
+totals / ratios / DSCR / Snap as live formulas. See the README.
+
+Consequences worth knowing:
+- **Trade receivables and payables now have their own buckets** (`debtors`,
+  `sundry_creditors`). Older analyst sheets without those rows are compared by
+  folding ours back into Current Assets / Current Liabilities
+  (`tests/test_golden_values.py`).
+- **Ratio definitions now follow the analysts' formulas exactly** - ROCE uses
+  PAT + interest, LT Debt includes maturities within a year, the Current
+  Ratio divides by CC/OD and maturities too. For Borrower B the user's
+  CC/OD decision (Case 21) therefore also moves its Current Ratio (5.09 ->
+  1.55 for FY24); recorded as a known divergence.
+- **Unread = 0, flagged.** A statement that could not be read shows 0 so every
+  formula still works, filled red with a note - never a silent zero.
+- **Testing formulas, not copies of them.** `tests/xlsx_eval.py` evaluates the
+  workbook's own formula text. Its first version had two bugs the real
+  corpus exposed at once: nested formula evaluation overwrote the outer
+  parse, and an `IFERROR` catching an error around a `SUM(` miscounted
+  brackets (an all-zero unread column made TOL/TNW divide by zero). Both
+  fixed; the unread-column test now evaluates every ratio.
+
 ## Template for new cases
 
 ```

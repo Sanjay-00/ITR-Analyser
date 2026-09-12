@@ -77,6 +77,33 @@ turnover, profit contradicting the tax computation). Thresholds live in one
 pages, of which 19 carried anything needed. Audit clauses, TDS listings and
 schedules are dropped before any expensive work.
 
+## Output: the ITR Validation workbook
+
+Sheet 1 is always the same **combined master format** - the union of the
+analysts' two reference layouts (`Format.xlsx` and `Validation Format-
+check.xlsx`), agreed 2026-09-12:
+
+- **P&L:** Sales, Gross Receipts; Purchases, Transport, Electricity, Employee,
+  Other Expenses, Interest, Depreciation, Extra Ordinary; Gross Expenses; PBT;
+  tax and deferred tax (entered **positive and subtracted**); PAT; Cash Profit.
+- **Balance Sheet:** the ten liability rows plus **Sundry Creditors**, the
+  seven asset rows plus **Debtors / Receivables**, with totals.
+- **Ratios:** ROCE, ROE, PAT/Income, PAT/Assets, LT Debt/Equity and TOL/TNW
+  (both inclusive of quasi-equity), Interest Coverage, Current Ratio, DSCR,
+  **Debtor Days, Creditor Days**.
+- **DSCR Calculation** (the analyst keys the EMIs) and the **Financial Snap**.
+
+Figures read from the accounts are written as plain lakhs; every total,
+ratio, DSCR and Snap figure is a **live Excel formula**, defined once in
+`engine/mapping/template_config.py`. A row the borrower does not use shows 0.
+A row that could not be *read* also shows 0 so the formulas keep working, but
+is **filled red with a note** - "no income" and "income not read" must never
+look alike. Column headings say *Audited* or *Provisional* (detected from
+"PROV." headings). Sheets 2 and 3 are the Analysis and the Audit Trail.
+
+`tests/test_master_excel.py` evaluates the workbook's own formulas
+(`tests/xlsx_eval.py`) and checks them against the Python ratios.
+
 ## Layout
 
 ```
@@ -159,6 +186,13 @@ the analyst's ITR Validation sheet selected, **1,565 cells are compared and
 Borrower L). Borrower H 94/133, Borrower O 108/108, Borrower P 150/158 differ - mostly unread
 ("Check ITR"), not wrong. On the 13 borrowers that were compared all along:
 mismatched rows 827 -> 682 -> 446, no borrower worse.
+
+**After the switch to the combined master format (2026-09-12):** 773 of
+1,538 compared cells differ (**~50% cell accuracy**, from ~49%); Borrower A
+and Borrower L match fully, Borrower K is off by 1 row; no borrower got worse and eight
+improved slightly (Borrower Q 36->32, Borrower N 113->104, Borrower P 150->146, ...).
+Digital/Tally statements: 95-100%. Poor scans and messy multi-file folders
+remain the gap - see docs/SHORTCOMINGS.md.
 About 14 of the drop are analyst conventions recorded as known divergences
 (Borrower B's EDFS loan as CC/OD, by decision; Borrower A's placement of
 hiring costs and Diwali expenses), not reading fixes. Biggest moves: Borrower A 62 -> 0, Borrower L 76 -> 0, Borrower E 56 -> 11, Borrower F 76 -> 27, Borrower J 40 -> 14.

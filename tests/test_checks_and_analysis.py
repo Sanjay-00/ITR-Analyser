@@ -453,8 +453,9 @@ def test_figure_printed_above_its_caption_takes_that_caption():
 
 def test_current_asset_wording_beats_a_carried_investment_tag():
     for label in ("[INV] Loans & Advances", "[INV] Cash & Bank Balance",
-                  "[INV] Sundry Debtors", "[FA] Other Current Assets"):
+                  "[FA] Other Current Assets"):
         assert T.map_label(label, {}) == "current_assets", label
+    assert T.map_label("[INV] Sundry Debtors", {}) == "debtors"
     assert T.map_label("[INV] Fdr in Ubi 1", {}) == "investments"
     assert T.map_label("[FA] Mh-12-1615", {}) == "fixed_assets"
 
