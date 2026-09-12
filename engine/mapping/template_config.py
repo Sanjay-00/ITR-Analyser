@@ -286,6 +286,19 @@ SYNONYMS = [
     # capital-account line ("CAPITAL ACCOUNT OF: <name>") but had no
     # consuming rule at all until now, so it never actually did anything.
     ("equity_capital",              r"^\[EQ\]"),
+    # A line that NAMES a current asset outright is a current asset, whatever
+    # caption a T-account's side last carried. A bare "Investment" caption's
+    # [INV] context ran on down the assets side of a real filing (Borrower F
+    # Roadways FY2023) and filed Loans & Advances, Sundry Debtors and Cash &
+    # Bank as investments. Placed before the [FA]/[INV] context rules, which
+    # exist for lines with no vocabulary of their own (an asset's or a
+    # lender's bare name).
+    ("current_assets",              r"^\[(?:FA|INV)\].*\b(?:loans?\s*(?:&|and)\s*advances?|"
+                                    r"cash\s*(?:&|and)\s*bank|bank\s+balances?|"
+                                    r"cash\s+(?:in|on)\s+hand|cash-in-hand|"
+                                    r"sundry\s+debtors?|debtors?|receivables?|"
+                                    r"closing\s+stock|stock\s+in\s+hand|"
+                                    r"other\s+current\s+assets?)\b"),
     ("secured_loan_asset_financed", r"^\[SL\]"),
     ("unsecured_loans",             r"^\[UL\]"),
     ("fixed_assets",                r"^\[FA\]"),
@@ -307,7 +320,10 @@ SYNONYMS = [
     ("lt_loans_advances",           r"long[\s-]*term\s+loans?\s*(?:&|and)?\s*advance"),
     # A bare "Borrowings" reaches here only from a NON-current section - the
     # [CL] rule above has already claimed the current-liability one.
-    ("secured_loan_asset_financed", r"secured\s+loan|term\s+borrowing|term\s+loan|"
+    # (?<!un): "Unsecured Loans" CONTAINS "secured loan", and this rule is
+    # checked before the unsecured one below - every unsecured loan line was
+    # being filed as secured.
+    ("secured_loan_asset_financed", r"(?<!un)secured\s+loan|term\s+borrowing|term\s+loan|"
                                     r"\bborrowings?\b|"
                                     r"vehicle\s+loan|hypothecat|loan\s+from\s+bank"),
     # A lease liability carries no charge on assets, so the existing workbooks
@@ -325,6 +341,18 @@ SYNONYMS = [
     # on a real filing this line's schedule was entirely bank/NBFC term
     # loans - rather than leaving it unmapped and excluded from the sheet.
     ("secured_loan_asset_financed", r"^\[LIAB\].*\bloans?\b"),
+    # Tally's borrowings group printed as a line WITH its own total, in a
+    # summary Balance Sheet ("Loans (Liability) 2,04,37,748", Borrower E
+    # Enterprises FY2024 and FY2023) - it matches no other rule, and the whole
+    # of the year's borrowings dropped out of the sheet. The analyst files it
+    # as Secured loan - Asset Financed (204.38 / 35.89 lakh, to the rupee).
+    ("secured_loan_asset_financed", r"\bloans?\s*\(\s*liabilit"),
+    # Same idea for a lender listed by NAME under the liabilities side's
+    # "Loans (Liability)" caption ("MUTHOOT FINANCE LTD", "IDFC FIRST BANK").
+    # On a real filing (Borrower J / Borrower J FY2023) these two were
+    # unmapped; with them, Secured Loans equals the analyst's 57.94 lakh.
+    ("secured_loan_asset_financed", r"^\[LIAB\].*\b(?:finance|financial|bank|"
+                                    r"nbfc|capital\s+(?:ltd|limited))\b"),
     ("other_lt_liabilities",        r"(?:other\s+)?long[\s-]*term\s+(?:liabilit|"
                                     r"borrowing|provision)|non[\s-]*current\s+liabilit"),
     # Schedule III spells trade creditors out longhand: "Total outstanding dues
@@ -358,8 +386,22 @@ SYNONYMS = [
     # for the non-current section - the current-section namesake is a
     # receivable.
     ("investments",                 r"^\[NCA\].*financial\s+asset"),
-    ("investments",                 r"\binvestment|shares?\s+(?:in|of)\b|gold\s+ornament|"
+    ("investments",                 r"\binvestment|shares?\s+(?:in|of)\b|"
+                                    r"gold\s*(?:&|and)?\s*ornament|"
                                     r"fixed\s+deposit|\bFDR?\b"),
+    # A proprietor's T-account often lists fixed assets by WHAT THEY ARE, with
+    # no "Fixed Assets" caption above them ("COMPUTER", "HONDA CAR", "MOTOR
+    # TRUEK", "AIRCONDTIONER") - unmapped on a real filing (Borrower J FY2023,
+    # Rs 28 lakh of assets). Never on a P&L line ([INC]/[EXP]) and never a
+    # label that reads as a running cost, so "Car Expenses" or "Vehicle
+    # Insurance" stays an expense.
+    ("fixed_assets",                r"^(?!\[(?:INC|EXP)\])"
+                                    r"(?!.*\b(?:exp\.?|expenses?|repairs?|maint\w*|"
+                                    r"insurance|running|hire|rent|fuel|loan|emi)\b)"
+                                    r".*\b(?:computers?|laptops?|mobiles?|bikes?|"
+                                    r"cars?|trucks?|truek|motor|tempo|lorry|"
+                                    r"air\s*-?\s*condi?tione?rs?|household\s+appliances?|"
+                                    r"printers?|machinery|equipments?)\b"),
     ("current_assets",              r"trade\s+receivable|sundry\s+debtor|"
                                     r"\bdebtors?\b|bills?\s+receivable"),
     ("other_non_current_assets",    r"other\s+non[\s-]*current\s+asset|"
@@ -386,7 +428,10 @@ SYNONYMS = [
                                     r"income[\s-]*tax)))"),
     ("employee_costs",              r"employee|salar(?:y|ies)|wages|staff|bonus|"
                                     r"pagar|labour|gratuity|provident"),
-    ("electricity",                 r"electricity|power\s*(?:&|and)?\s*fuel"),
+    # "Light Bill" is the everyday small-business name for the electricity
+    # bill - the analyst's own Borrower B sheet files it here.
+    ("electricity",                 r"electricity|power\s*(?:&|and)?\s*fuel|"
+                                    r"light\s+bill|\bmseb\b|\bmsedcl\b"),
     ("purchases",                   r"purchase|cost\s+of\s+material|raw\s+material|"
                                     r"changes?\s+in\s+inventor|stock[\s-]*in[\s-]*trade"),
     # "Direct Expenses" / "Operating costs" is the operating-cost line of a
@@ -395,6 +440,7 @@ SYNONYMS = [
     ("transport_admin",             r"direct\s+expense|operating\s+(?:expense|cost)|"
                                     r"cost\s+of\s+(?:services|operations)|"
                                     r"transport|freight|diesel|fuel|toll|tyre|"
+                                    r"tanker|"
                                     r"\br\.?t\.?o\.?\b|road\s+tax|"
                                     r"stores?\s*(?:&|and)?\s*spares?|hamali|"
                                     r"vehicle\s+(?:running|expense)|"
@@ -436,6 +482,10 @@ SYNONYMS = [
 # them. Each rule below records what was assumed and why.
 
 CONVENTIONS = [
+    (re.compile(r"^\[(?:INC|EXP)\].*\bopening\s+stock\b", re.I),
+     "Opening stock added to Purchases (trading-account stock movement)"),
+    (re.compile(r"^\[(?:INC|EXP)\].*\bclosing\s+stock\b", re.I),
+     "Closing stock deducted from Purchases, not counted as income"),
     (re.compile(r"right[\s-]*of[\s-]*use", re.I),
      "Right-of-use (leased) assets grouped with Fixed Assets"),
     (re.compile(r"lease\s+liabilit", re.I),

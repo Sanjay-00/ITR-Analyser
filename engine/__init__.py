@@ -21,9 +21,10 @@ from .parser import spread, extract_text, vision_read
 from .excel_generator import generate_excel, get_filename, ROWS, SNAP_ROWS, LAKH
 from .extract import financials
 from .mapping import taxonomy
+from . import analysis
 
 __all__ = [
     "spread", "extract_text", "vision_read",
     "generate_excel", "get_filename", "ROWS", "SNAP_ROWS", "LAKH",
-    "financials", "taxonomy",
+    "financials", "taxonomy", "analysis",
 ]

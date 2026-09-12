@@ -16,6 +16,7 @@ since ITR forms are almost entirely "label ......... value" two-column rows.
 """
 
 import os
+import re
 import json
 
 import fitz  # PyMuPDF
@@ -284,6 +285,94 @@ def _fast_page_text(engine_name, engine, img) -> str:
     return engine.image_to_string(img, config=_TESS_CONFIG)
 
 
+# ─────────────────────────────────────────────────────────────────
+# SIDEWAYS SCANS
+# ─────────────────────────────────────────────────────────────────
+# A scanned page can be rotated in its IMAGE while the PDF says rotation 0 -
+# confirmed on a real filing (docs/SHORTCOMINGS.md Case 9): a correctly drawn
+# Balance Sheet came back as unreadable fragments and its heading never
+# matched, so the whole statement was invisible, not merely unverified.
+#
+# Detected by trying it: a page whose cheap-pass text holds almost no real
+# words is re-OCR'd at each other right angle, and the angle that reads as
+# plainly more text wins. Chosen over Tesseract's OSD (image_to_osd), which
+# needs a separate traineddata file some installs lack and reports an angle
+# whose direction convention differs between versions - scoring the actual
+# output has neither problem. Costs three cheap OCRs, only on pages that are
+# already failing to read.
+#
+# Scored by KNOWN words, not by letter runs: measured on real pages,
+# Tesseract turns sideways text into letter-shaped junk that is just as
+# "wordy" (115 three-letter runs sideways vs 108 upright on the same Balance
+# Sheet) - a letter-run count never rotated anything. Known-vocabulary hits
+# separate cleanly: 42-128 upright against at most 5 at 90/180 degrees, on a
+# digital page, a poor scan and a clean scan alike.
+_VOCAB = frozenset(
+    "the and of to for as at on by total balance sheet profit loss account "
+    "capital assets asset liabilities current fixed loans loan cash bank "
+    "sundry creditors debtors income expenses expense sales tax year ended "
+    "march share reserves surplus investments depreciation interest salary "
+    "rent net gross particulars amount schedule note from other advances "
+    "stock payable receivable provision".split())
+_WORD_RE = re.compile(r"[A-Za-z]{2,}")
+_UPRIGHT_MIN_WORDS = 8
+_ROTATIONS = (90, 270, 180)
+
+
+def _word_score(text: str) -> int:
+    return sum(1 for w in _WORD_RE.findall(text or "") if w.lower() in _VOCAB)
+
+
+def _best_rotation(read_fn, img, text: str) -> tuple:
+    """
+    (angle, text) - the counter-clockwise rotation that makes `img` read as
+    text, and that reading. `read_fn(img) -> str` is the cheap OCR. Angle 0
+    unless another orientation reads at least twice as many words AND clears
+    _UPRIGHT_MIN_WORDS on its own, so a sparse but upright page is never
+    turned on its side by noise.
+    """
+    base = _word_score(text)
+    if base >= _UPRIGHT_MIN_WORDS:
+        return 0, text
+    best = (0, base, text)
+    for angle in _ROTATIONS:
+        try:
+            t = read_fn(img.rotate(angle, expand=True))
+        except Exception:
+            continue
+        s = _word_score(t)
+        if s > best[1]:
+            best = (angle, s, t)
+    angle, score, t = best
+    if angle and score >= _UPRIGHT_MIN_WORDS and score >= 3 * max(base, 1):
+        return angle, t
+    return 0, text
+
+
+def _rotated(img, angle: int):
+    return img.rotate(angle, expand=True) if angle else img
+
+
+def _fast_upright(pytess, img) -> tuple:
+    """Cheap-pass OCR of one page with rotation detection: (angle, text)."""
+    def read(im):
+        return _fast_page_text("tesseract", pytess, im)
+    return _best_rotation(read, img, read(img))
+
+
+def _render_upright(page, pytess):
+    """Full-quality render, turned upright when the cheap pass says the scan
+    is sideways. For callers with no cheap pass of their own (ocr_pages)."""
+    full = _render_pil(page)
+    if pytess is None:
+        return full
+    try:
+        angle, _t = _fast_upright(pytess, _render_pil(page, _FAST_MATRIX))
+    except Exception:
+        return full
+    return _rotated(full, angle)
+
+
 def _run_pool(indices, render, ocr_one, engine, on_progress=None,
              done_start=0, total=None):
     """
@@ -340,7 +429,11 @@ def ocr_pages(doc, indices: list, on_progress=None) -> dict:
         return {}
     engine_name, engine = _active_engine()
     ocr_one = _ocr_image_rapidocr if engine_name == "rapidocr" else _ocr_image
-    return _run_pool(indices, render=lambda i: _render_pil(doc[i]),
+    try:
+        pytess = _configure_tesseract()
+    except Exception:
+        pytess = None
+    return _run_pool(indices, render=lambda i: _render_upright(doc[i], pytess),
                      ocr_one=ocr_one, engine=engine, on_progress=on_progress,
                      total=len(indices))
 
@@ -392,16 +485,22 @@ def ocr_document(doc, on_progress=None) -> tuple:
     fast = _run_pool(
         range(total),
         render=lambda i: _render_pil(doc[i], _FAST_MATRIX),
-        ocr_one=lambda eng, img: _fast_page_text("tesseract", eng, img),
+        ocr_one=_fast_upright,
         engine=fast_pytess, on_progress=on_progress, total=fast_total)
+    # Rotation found by the cheap pass (see _best_rotation) is applied to
+    # every later full-quality render of the same page.
+    rot = {}
     for i in range(total):
-        page_texts[i] = fast.get(i, "")
+        rot[i], page_texts[i] = fast.get(i, (0, ""))
 
     keep = set(relevance.select(page_texts))
 
+    def _render_full(i):
+        return _rotated(_render_pil(doc[i]), rot.get(i, 0))
+
     # Pass 2: full geometry-aware OCR, only on the pages worth harvesting.
     full = _run_pool(
-        sorted(keep), render=lambda i: _render_pil(doc[i]), ocr_one=ocr_one,
+        sorted(keep), render=_render_full, ocr_one=ocr_one,
         engine=engine, on_progress=on_progress, done_start=total,
         total=fast_total)
     for i, (text, rows, conf) in full.items():
@@ -433,7 +532,7 @@ def ocr_document(doc, on_progress=None) -> tuple:
     if not relevance.has_both_statement_kinds(page_texts):
         rest = [i for i in range(total) if i not in keep]
         if rest:
-            widened = _run_pool(rest, render=lambda i: _render_pil(doc[i]),
+            widened = _run_pool(rest, render=_render_full,
                                 ocr_one=ocr_one, engine=engine,
                                 on_progress=on_progress, done_start=total,
                                 total=total + len(rest))

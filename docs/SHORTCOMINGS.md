@@ -289,10 +289,10 @@ post-hoc parser patch.
   account or a different Borrower S family entity in the same bundle;
   needs a ground-truth check before drawing any conclusion.
 - The same-cell amount-run pattern behind Case 3 and Case 6's residual
-  shortfall (OCR concatenating multiple printed amounts into one cell with
-  no usable gap between them) needs a fix in `layout.py`'s row/cell
-  reconstruction, not in `financials.py` - flagged twice now on two
-  different pages of the same bundle, so it is worth prioritising.
+  shortfall - **root cause fixed 2026-09-10 in `layout.rows_with_cells`**
+  (see Case 21, item 5): the OCR engine returned the amounts as separate
+  boxes; our row clustering fused them. Cases 3 and 6 should be re-checked
+  against their source PDFs, which are not in the current sample set.
 
 ---
 
@@ -550,6 +550,263 @@ same ~₹1.3 crore); the sub-classification did not.
 See `tests/test_units.py` (`test_harvest_vertical_captures_comparative_grand_totals`
 and neighbours) and `tests/test_vision_verification.py` (`_recover_from_comparative`
 tests, including the different-entity and don't-overwrite-real-figures guards).
+
+---
+
+## Review: 2026-09-10 — checks that could not see their own failure, and the Tally layout
+
+A whole-codebase review against the full sample corpus (16 borrowers with an
+analyst reference workbook). Baseline before any change: **3 of 16 borrowers
+matched their reference; 856 mismatched rows in total** (no Vision).
+
+### 15. The profit cross-check compared magnitudes only — FIXED 2026-09-10
+
+`_profit_crosscheck` measured `abs(abs(stated) - abs(derived))`, so a loss read
+as a profit of the same size (exactly Case 11) produced a zero gap and no
+warning. Now also compares the SIGN, using the result line's wording ("Net
+Loss" vs "Net Profit") since a T-account prints its closing line as a positive
+figure either way (`taxonomy.stated_is_loss`).
+
+### 16. A one-sided P&L could still VERIFY — FIXED 2026-09-10
+
+Case 12 fixed the regex that dropped an income line, not the check that let
+the block pass: a T-account's debit side (expenses + closing profit) sums to
+the printed total on its own, so a P&L with an EMPTY credit side verified with
+income silently zero. `check_block` now refuses a single-sided P&L that holds
+no income-looking line.
+
+### 17. The learned label cache stored account numbers and a wrong-by-position mapping — FIXED 2026-09-10
+
+`data/label_map.json` held `"axis bank a c 17194"`, `"axis bank a c 82847"`,
+a proprietor's name, and `"inc by closing stock" -> current_assets` (a P&L
+credit filed as a balance-sheet asset). The cache filter now refuses any
+label with a 4+ digit run and any `[INC]`/`[EXP]` line mapped to a
+balance-sheet bucket - on write AND on read, so a stale copy can't reintroduce
+them. Existing bad entries removed.
+
+### 18. Independent profit cross-check from the computation of income — NEW 2026-09-10
+
+The computation sheet restates the P&L's bottom line ("Net Profit / (Loss) as
+per profit & loss A/c (15,32,419)"), typed separately and usually digital - a
+genuinely independent reading, unlike a Vision re-read of the same image
+(the gap Case 2 kept running into). `itr_parser.extract_book_profit` reads it;
+`columns._book_profit_crosscheck` warns on a signed mismatch. Found on 5 of the
+digital sample bundles, matching the known figures (Borrower K 24-25's -15.32 lakh).
+
+### 19. Sideways scans — FIXED 2026-09-10 (Case 9)
+
+Cheap-pass OCR now retries a page at 90/180/270 degrees when it reads almost
+no known words, and later full-quality renders use the winning angle
+(`ocr_extractor._best_rotation`). First attempt scored by letter-runs and was
+**verified not to work on real pages**: Tesseract turns sideways text into
+equally "wordy" junk (115 runs sideways vs 108 upright). Scoring by known
+accounting vocabulary separates cleanly (42-128 upright, at most 5 sideways).
+
+### 20. Tally-exported statements read as nothing at all — FIXED 2026-09-10
+
+**Borrower:** Borrower L / Borrower L, AY 2024-25 and 2025-26, both
+digital. **Before:** "No usable financial statements were found" for both
+years - 78 mismatched rows - while the computation sheet plainly stated profit.
+
+Tally is the default package for small Indian businesses, so this layout is
+likely common across the book. Five separate faults:
+
+1. **Vehicle registrations are not "label text".** Every label test required a
+   three-letter run; "MH-12-PQ-9115" has none, so a transport company's whole
+   vehicle schedule was invisible and each vehicle's amount was handed to the
+   liability label on the same row. (`financials._has_label_text`)
+2. **Group totals hide the breakdown.** Tally prints "Indirect Expenses
+   1,14,61,430" in the outer column with its ledgers (Depreciation 81.4 lakh,
+   Bank Interest 32.7 lakh) indented beneath. The outer column is what
+   reconciles, so depreciation and interest read as zero. A chosen group total
+   is now replaced by the ledgers that follow it **only when they sum to it
+   exactly** (`_expand_groups`), so the balance proof is unchanged.
+3. **One "Total" closes only the P&L half of a combined Trading + P&L
+   account**, and Tally offsets the Trading half's own closing figures by a row,
+   so `_harvest_segmented` can't split it. Now the two sides are made to agree
+   with each other across the whole account, accepted only when a matching
+   "Gross Profit c/o" / "b/f" pair is present (`_harvest_combined`,
+   `_pick_joint`). The first version picked a trivial reading (the Trading
+   half's two stray closing figures balancing each other) - hence the
+   transfer-pair requirement inside the search, not after it.
+4. **"Nett Profit"** (Tally's spelling) wasn't recognised as the result line.
+5. **"Loans (Liability)"** didn't end the capital section, so Secured Loans
+   were tagged equity.
+
+Also found on the way, affecting **every** borrower:
+
+- **"Unsecured Loans" was filed as secured** - `secured\s+loan` matches inside
+  "unsecured loans" and that rule runs first. Fixed with `(?<!un)`.
+- **"Add: Profit for the Year" inside the capital section was ignored** as a
+  subtotal, cutting Net Worth by the whole year's profit (Rs 54.71 lakh here).
+  Now counted as equity when it sits under a capital heading.
+- **Gearing ratios ignored quasi-equity.** "(inclusive q/e)" means unsecured
+  loans count as owners' money: added to net worth, removed from debt. The
+  analyst's sheet matches this exactly (304.74 / (269.24 + 3) = 1.119); ours
+  read 1.143.
+
+**After:** 29 mismatched rows went to 0 real ones. Both years' P&L and Balance
+Sheet match the reference row for row; the remaining two rows are the
+analyst's hand-typed flat 0.50 lakh Other Expenses (the statement's own lines
+sum to 0.522 / 0.548) and DSCR, which depends on hand-keyed EMI.
+
+### 21. Borrower B (proprietor, petrol pump), FY2024 & FY2025 scans — PARTLY FIXED 2026-09-10
+
+80 mismatched rows before, **21 after** - and none of the 21 is an extraction
+error (see "Still open" below). Six separate faults:
+
+1. **A dotted date made the Balance Sheet heading invisible.** "BALANCE SHEET AS
+   ON 31.03.2024" contains "31.03", which `_match_title`'s money test reads as
+   rupees-and-paise. The Balance Sheet merged into the Capital Account printed
+   above it on the same page and the whole block was classed a capital
+   account - no Balance Sheet for either year. Dates are now stripped before
+   the money test.
+2. **Stock movement was excluded, distorting profit.** Opening/Closing Stock
+   was left unmapped; the analyst nets it into Purchases (FY24: 1985.23 =
+   44.16 + 1960.09 - 19.02, to the rupee). Now netted the same way - profit
+   unchanged by construction, mapping check signs it identically.
+3. **"Gross prfit trf"** (OCR) wasn't recognised as the transfer line and was
+   counted as an expense: a 10.70 lakh profit read as a 31.17 lakh loss. FY25
+   profit now matches the reference.
+4. **"2.35.51,356.00"** - OCR read the Balance Sheet total's commas as dots and
+   only the tail parsed. Mixed separators are normalised at OCR ingest.
+5. **Two printed lines fused into one cell** ("45,77,061.00 96,250.00") - the
+   Case 3 / Case 6 same-cell amount-run pattern, on a third borrower. **Root
+   cause found and fixed, and it was not the OCR engine**: RapidOCR returns the
+   two figures as separate boxes (verified at four detector settings). Our own
+   `layout.rows_with_cells` put them in one row because tightly-spaced scans set
+   consecutive lines closer than its row tolerance, and first-fit joined them;
+   same x, so they then fused into one cell. A box now never joins a row that
+   already holds a box at the same horizontal position (two boxes that overlap
+   horizontally cannot be on one printed line), and it joins the NEAREST
+   eligible row. Digital and Tesseract words never overlap on a real line, so
+   nothing else changes. FY24's P&L went from unread to read.
+
+   **First version regressed another borrower, caught by the full golden
+   run:** Borrower M's FY2025 Schedule III Balance Sheet verified before
+   and failed after (65 -> 85 mismatched rows). Isolated by re-running the same
+   file with each of the day's changes switched off in turn - only the row rule
+   mattered. Same geometry, different meaning: there the stacked line was the
+   second line of a wrapped CAPTION with no figure of its own, which belongs
+   with the figure on the other line. `layout._rejoin_wrapped` now merges
+   stacked neighbours back unless BOTH carry money - two data lines stay
+   apart, a wrapped caption behaves exactly as before. Borrower M back to 65,
+   Borrower B's gain kept (21).
+6. **"# Net profit trf to Capital A/c"** - the scan's ditto mark OCR'd as "#"
+   hid the result line from the subtotal rule, so the year's 14.46 lakh profit
+   was counted as an expense and profit read as nil. Leading scan punctuation
+   is now skipped.
+
+**Still open:**
+- **Convention question for the analyst, not a bug:** the reference files
+  "SBI EDFS loan CC" under Secured loan - Asset Financed; we follow the
+  label's "CC" and file it as CC/OD. Totals agree; the split differs by
+  66.3 lakh (FY24). EDFS is a dealer working-capital line, so CC/OD is
+  defensible. **Decided 2026-09-11: keep CC/OD** (user's call); recorded as a
+  known divergence in `tests/test_golden_values.py`.
+- Smaller line placements (e.g. "Company debit" in Interest, admin items in
+  Transport) are the analyst's per-borrower judgement.
+
+### 22. Borrower A (proprietor, transport), FY2024 & FY2025, digital — FIXED 2026-09-11
+
+62 mismatched rows before, **4 after** (the 4 are the analyst's placement
+choices - hiring/fuel costs under Purchases, Diwali expenses under Employee -
+with gross expenses and profit matching both years). Three faults, all on
+DIGITAL pages, none of them OCR:
+
+1. **The wrong reading of a two-sided Balance Sheet won.** `_harvest` picks
+   between a T-account and a vertical reading by asking which "verifies" - but
+   checked every block generically. A vertical mis-read lumped both sides into
+   one big section that reconciled to the page total, so it "verified" and was
+   returned; the real Balance Sheet check (needing both grand totals) then
+   rejected it as unverified. The T-account reading reconciled exactly at
+   every candidate divider and was never used. A heading that plainly says
+   "Balance Sheet" is now passed through, and readings are judged by the
+   Balance Sheet's own check (`kind_hint`).
+2. **An overdrawn proprietor's capital was read as positive equity.** The
+   capital account (Rs 36.59 lakh) is printed on the ASSETS side - a debit
+   balance. The analyst shows Equity -36.59 with both totals reduced by it
+   (750.46 -> 713.87). A capital line on a T-account Balance Sheet's assets
+   side is now spread as negative equity (`columns._spread_items`); the block's
+   own balance proof is untouched.
+3. **A closing TOTAL printed without separators ("168012440") wasn't
+   recognised** by `_printed_total` / `_subtotal_rows` (Case 12 had fixed this
+   only for line items). The total and the unlabelled expense subtotal were
+   harvested as items, and the FY2025 P&L failed by Rs 16.5 crore. A whole-cell
+   bare integer now counts there too - except a 4-digit year, so a "2025 |
+   2024" header can't pass for a matching pair of totals.
+
+### 23. Borrower N (Pvt Ltd), FY2025 — SOURCE QUALITY, deprioritised 2026-09-11
+
+114 mismatched rows, every statement failing - but **the OCR is not the
+problem** (page confidence 0.97-0.98, figures read correctly). The typed
+statement itself is misaligned: its figures sit one row away from their
+captions ("(1) Shareholders' Funds 100" is Share Capital's 100; "(a) Share
+Capital -214" is Reserves' -214), a "Total Expenses" caption shares a line
+with "Employee Benefit Expenses", and a "21747" sits against a 172.47 lakh
+current-liabilities figure. The analyst re-keyed it by judgement. A tiny
+company (Rs 12.45 lakh turnover); a special rule for one malformed layout is
+not worth the risk to every well-formed Schedule III page. Left as-is: the
+balance check correctly refuses to ship these numbers ("Check ITR").
+
+### 24. Scan-reading pass, 2026-09-11 — six borrowers, one fault class each
+
+Each fault below was isolated on the real page (row dump with x-positions)
+before any change, and each fix is pinned by a unit test built from that
+page's own text and coordinates.
+
+- **Borrower J / Borrower J FY2023 (digital) — Balance Sheet now matches the
+  analyst on every row.** (a) "CAPITAL ACCOUNT | COMPUTER | 10172" - a row, not a
+  heading - opened a phantom block and cut the Balance Sheet in two; a heading
+  may now carry no standalone figure other than a year. (b) Depreciation
+  workings typed without separators ("LESS : DEP | 12973 116759.00") fused the
+  depreciation and the net value into one cell; the net was read at the wrong
+  x and no set of columns reconciled (assets over by Rs 7,37,587). Cells of
+  only figures are now split per figure. (c) Fixed assets listed by name
+  (COMPUTER, HONDA CAR, MOTOR TRUEK) and lenders by name (MUTHOOT FINANCE,
+  IDFC FIRST BANK) were unmapped - new rules, guarded so "Car Expenses" stays
+  an expense.
+- **Borrower I FY2023 — garbled embedded OCR layer.** The PDF carried a
+  scanner app's own text layer ("51,65,06,94g", "1,,33,94,6L,760"), trusted as
+  exact digital text because it was not blank. Such pages are now detected
+  (`parser._looks_garbled`) and re-read with our OCR. **Still open:** its P&L
+  face shows only Direct/Indirect expenses; the analyst took the Employee /
+  Interest split from the schedule pages. Reading schedules is a new feature.
+- **Borrower F FY2023-FY2025.** (a) FY2025 heading "Balance Sheet as at
+  31st March,?025" - the bare-figure rule from (Borrower J a) must only reject a
+  standalone number, not a damaged year. (b) This year's and last year's
+  figures fused in one cell ("24,18,44,856 12,32,46,427"); the vertical reader
+  took the last one (last year's). (c) FY2023/24: asset figures printed one
+  row ABOVE their captions, on rows whose only label is a liability
+  ("a relative ... 5,67,565" / "Investment"). Far across the divider,
+  position now beats the row label, and the figure takes the caption printed
+  just below it (`pending` in `_harvest_at`) - Rs 8.26 crore of fixed assets
+  had been "(unlabelled)". (d) A carried "Investment" caption filed Loans &
+  Advances, Debtors and Cash as investments; explicit current-asset wording
+  now wins. All three Balance Sheets verify.
+- **Borrower M FY2025 — P&L now verifies (PBT 356.22, PAT 303.04 lakh,
+  matching the page).** (a) Expense total printed unlabelled under "IV
+  EXPENSES" - accepted as the expense side. (b) "XVII Profit/(Loss) Carried
+  over to Balance Sheet" opened a phantom Balance Sheet - a line referring to
+  the Balance Sheet is no longer a heading. (c) OCR set the Rs 303 lakh PAT a
+  second time against "XVI Deferred Tax (Liability) - Earlier Year"; counted,
+  it wiped out the year's profit. A figure equal to the result row just
+  skipped is a restatement.
+- **Borrower E FY2023-FY2025.** (a) "Loans (Liability) 2,04,37,748" as a
+  line with its own total matched nothing - Rs 2.04 crore of borrowings fell out
+  of the sheet (the analyst's figure, to the rupee). (b) Summary P&L with
+  lettered headings ("A] Income :-", "B] Expenditure :-") and bare "Total
+  (A)/(B)": neither side could be identified; bare totals now take the heading
+  they close. (c) The result line wrapped over two rows ("Net Profit / Loss
+  Transferred to" / "E] Proprietor's Capital Account 32,69,400"); joined. (d)
+  **An older bug found on the way:** `_DERIVED_ROW_RE`'s `(before|after|for`
+  group was never closed, so "carried over to Balance Sheet" had only ever
+  matched after a "Profit / Loss " prefix.
+- **Borrower Q FY2026 — decimal point read as a comma** ("Total current
+  assets 5,106,21" for 5,106.21 lakh; the total read 100x its items). A final
+  2-digit group after a 3-digit group is never valid grouping, so it is now
+  read as the decimal. **Still open:** the same year's P&L fails on a
+  deferred-tax sign in the tax section.
 
 ## Template for new cases
 

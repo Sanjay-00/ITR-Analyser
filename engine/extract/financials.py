@@ -321,13 +321,20 @@ _DERIVED_ROW_RE = re.compile(
     # ("XVII | Profit/(Loss) Carried over..."), printed as a literal "|" in
     # the extracted text - allow it alongside the usual space/period/paren.
     r"(?:[IVX]{1,4}[\s.)|]+|\(?\d{1,2}\)?[\s.)|]+)?"
-    r"(?:(?:net\s+)?profit\s+(?:before|after|for\s+the)"
-    r"|(?:net\s+)?profit\s*/?\s*\(?loss\)?\s+(?:before|after|for"
+    r"(?:(?:nett?\s+)?profit\s+(?:before|after|for\s+the)"
+    # The (before|after|for) group is closed HERE. It used to stay open, so
+    # the two alternatives below only ever matched after a "Profit / Loss "
+    # prefix - "Net Profit / Loss Transferred to ..." slipped through as a
+    # line item (found via the Borrower E summary P&L).
+    r"|(?:nett?\s+)?profit\s*/?\s*\(?loss\)?\s+(?:before|after|for)"
     # "...Carried over to Balance Sheet" restates the bottom-line figure
     # rather than adding a new one - on a real filing it was harvested as a
     # plain expense line and folded into Other Expenses, corrupting every
     # profit figure derived downstream.
-    r"|carried\s+(?:over\s+)?to\s+(?:the\s+)?balance\s+sheet)"
+    r"|carried\s+(?:over\s+)?to\s+(?:the\s+)?balance\s+sheet"
+    # "Net Profit / Loss Transferred to Proprietor's Capital Account" - the
+    # result line of a proprietor's summary P&L (Borrower E).
+    r"|(?:nett?\s+)?(?:profit|loss)\b[^|]{0,30}?\btransferred\s+to\b"
     r"|loss\s+for\s+the|total\s+comprehensive|other\s+comprehensive"
     r"|earnings?\s+per|basic\s*\(|diluted\s*\()", re.I)
 
@@ -533,6 +540,11 @@ _PERIOD_LOOKAHEAD = 3
 # page boundary also ends a block.
 
 
+# A dotted/slashed date ("31.03.2024", "31/03/2024"). "31.03" alone reads as
+# a figure with paise to _MONEY_RE.
+_DATE_IN_LINE_RE = re.compile(r"\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b")
+
+
 def _match_title(line: str) -> bool:
     flat = re.sub(r"\s+", " ", line).strip()
     if len(flat) > _MAX_TITLE_LEN:
@@ -541,7 +553,37 @@ def _match_title(line: str) -> bool:
     # would otherwise read as headings. Tested for grouping or paise rather
     # than with _AMOUNT_RE: most headings end in their own year, and a bare
     # "2026" is indistinguishable from an amount to a general number pattern.
-    if _MONEY_RE.search(flat):
+    #
+    # The heading's own DATE is removed first: "BALANCE SHEET AS ON
+    # 31.03.2024" contains "31.03", which reads as rupees-and-paise, so the
+    # heading was rejected outright. On a real filing (Borrower B, both
+    # years) the Balance Sheet then merged into the Capital Account printed
+    # above it on the same page, the whole block was classed as a capital
+    # account, and the year had no Balance Sheet at all.
+    undated = _DATE_IN_LINE_RE.sub(" ", flat)
+    if _MONEY_RE.search(undated):
+        return False
+    # A P&L's closing line REFERS to the Balance Sheet ("XVII Profit/(Loss)
+    # Carried over to Balance Sheet") - it is not one. On a real filing
+    # (Borrower M FY2025) it opened a phantom Balance Sheet block in
+    # the middle of the P&L page.
+    if re.search(r"\b(?:carried|transferred|trf|shown|taken)\b.{0,20}\bto\b.{0,10}"
+                 r"\bbalance\s*sheet\b", undated, re.I):
+        return False
+    # Nor does a heading carry a bare figure. "CAPITAL ACCOUNT | COMPUTER |
+    # 10172" is a Balance Sheet ROW - the liabilities side's capital line
+    # beside an asset and its cost, printed without separators (Borrower J /
+    # Borrower J AY 2023-24, a digital page). It passed every other
+    # test, opened a phantom "Capital Account" block, and cut the real Balance
+    # Sheet in two - neither half reconciled and the year had no Balance
+    # Sheet. Only a 4-digit year may stand alone in a heading.
+    #
+    # "Stand alone" means its own whitespace-delimited word. A scanner's text
+    # layer read Borrower F' FY2025 heading as "Balance Sheet as at 31st
+    # March,?025" - the "?025" is a damaged year, not a figure, and a plain
+    # \b\d{3,}\b match rejected the whole heading.
+    if any(not (len(n) == 4 and 1900 <= int(n) <= 2100)
+           for n in re.findall(r"(?<!\S)\d{3,}(?!\S)", undated)):
         return False
     return any(rx.search(flat) for rx in _TITLES)
 
@@ -657,8 +699,14 @@ def find_blocks(page_rows: list, only_pages=None) -> list:
             if foot is not None:
                 body = body[:foot]
             total, total_at = _printed_total(body)
+            # Only an unambiguous "Balance Sheet" heading is passed on - the
+            # case where a generic check picked the wrong reading. A vaguer
+            # heading keeps the old behaviour.
+            hint = (BALANCE_SHEET
+                    if _classify(lines[idx], {"left": [], "right": []}) == BALANCE_SHEET
+                    else None)
             sides = _harvest(body, page_width, total, total_at,
-                            title_cells=rows[idx][1])
+                            title_cells=rows[idx][1], kind_hint=hint)
             # A heading with no body - typically a statement's title reprinted
             # above the one that follows it. Not a statement, just noise.
             if not _has_items(sides):
@@ -729,12 +777,65 @@ def find_blocks(page_rows: list, only_pages=None) -> list:
 # vanished, rather than just losing its label's word-break.
 _WELDED_RE = re.compile(r"^(\(?\s*[\d,\s]+(?:[.,]\d{1,3})?\s*\)?)\s*(.+)$")
 
+# An Indian vehicle registration - "MH-12-PQ-9115", "Mh 12 Nx 3915",
+# "Mh-12-1615". A transport business's Fixed Assets schedule is a column of
+# nothing else, and none of them contains a three-letter run, which is what
+# every "is this a label?" test here used to require. On a real filing (a
+# Tally-exported Balance Sheet, Borrower L AY 2024-25) every vehicle label
+# was therefore invisible, and each vehicle's amount was handed to whatever
+# LIABILITY label sat on the same printed row - the Balance Sheet failed by
+# ~9.7 lakh with vehicle values filed as capital.
+_VEHICLE_REG_RE = re.compile(
+    r"\b[A-Za-z]{2}[\s-]*\d{1,2}[\s-]*(?:[A-Za-z]{1,3}[\s-]*)?\d{3,4}\b")
+
+
+def _has_label_text(txt: str) -> bool:
+    """Does this cell carry label text (as opposed to only a figure)?"""
+    return bool(re.search(r"[A-Za-z]{3}", txt) or _VEHICLE_REG_RE.search(txt))
+
+
+# A cell holding nothing but two or more money figures - "24,18,44,856
+# 12,32,46,427": this year and last year, their word boxes close enough to
+# fuse into one cell.
+# Comma-grouped, or a bare run of 3+ digits: a CA's depreciation working is
+# often typed without separators ("12973 116759.00", Borrower J FY2023) - which
+# the grouped-only form never split. Safe because a cell is only split when
+# it holds NOTHING but such figures; a note reference ("1 26") is too short
+# to match, and a label never matches at all.
+_AMOUNT_TOKEN = (r"\(?-?\s*(?:\d{1,3}(?:,\d{2,3})+|\d{3,})(?:\.\d{1,3})?\s*\)?")
+_AMOUNT_RUN_RE = re.compile(rf"^{_AMOUNT_TOKEN}(?:\s+{_AMOUNT_TOKEN})+$")
+
+
+def _split_amount_runs(cells: list) -> list:
+    """
+    Split a cell of several figures into one cell per figure, each given its
+    share of the cell's width in order - so each lands under its own period
+    column. A vertical statement picks this year's figure by position; left
+    fused, the cell's LAST figure (last year's) was the one read. Confirmed
+    on a real filing (Borrower F FY2025, Balance Sheet: "Long-term
+    borrowings 24,18,44,856 12,32,46,427" read as 12.32 crore).
+    """
+    out = []
+    for x0, x1, txt in cells:
+        t = txt.strip()
+        if not _AMOUNT_RUN_RE.match(t):
+            out.append((x0, x1, txt))
+            continue
+        toks = re.findall(_AMOUNT_TOKEN, t)
+        total_len = sum(len(k) for k in toks) or 1
+        pos = x0
+        for k in toks:
+            w = (x1 - x0) * len(k) / total_len
+            out.append((pos, pos + w, k.strip()))
+            pos += w
+    return out
+
 
 def _split_cells(cells: list) -> list:
     out = []
     for x0, x1, txt in cells:
         m = _WELDED_RE.match(txt.strip())
-        if m and re.search(r"[A-Za-z]{3}", m.group(2)):
+        if m and _has_label_text(m.group(2)):
             # Apportion the x-range by character count - approximate, but the
             # only thing it decides is which side of the page-midpoint each
             # part lands on, and the two parts sit either side of it by
@@ -807,7 +908,7 @@ def _pick_columns(cols: list, target):
 
 
 def _harvest(rows: list, page_width: float, printed_total, total_at=None,
-            title_cells=None) -> dict:
+            title_cells=None, kind_hint=None) -> dict:
     """
     Collect (label, amount) pairs per side of the account.
 
@@ -853,9 +954,16 @@ def _harvest(rows: list, page_width: float, printed_total, total_at=None,
     # only when neither does (or both do).
     preferred = vert if _orientation(rows) == VERTICAL and vert else t_best
     other     = t_best if preferred is vert else vert
-    if _verifies(preferred):
+    # Checked as the statement its heading plainly names (see find_blocks),
+    # not as a generic block. Checked generically, a vertical mis-read of a
+    # two-sided Balance Sheet "verified" on one big section that reconciled
+    # to the page's total - and won, although the real Balance Sheet check
+    # (which needs both grand totals) then rejected it. On a real filing
+    # (Borrower A, both years) the T-account reading reconciled
+    # exactly at every candidate divider and was never used.
+    if _verifies(preferred, kind_hint):
         return preferred
-    if other is not None and _verifies(other):
+    if other is not None and _verifies(other, kind_hint):
         return other
 
     # Neither verified, but they are not equally wrong. A vertical mis-parse
@@ -884,6 +992,10 @@ def _harvest(rows: list, page_width: float, printed_total, total_at=None,
     segmented = _harvest_segmented(body, page_width, printed_total)
     if segmented is not None:
         return segmented
+
+    combined = _harvest_combined(body, page_width, title_cells)
+    if combined is not None:
+        return combined
 
     return preferred
 
@@ -954,11 +1066,12 @@ def _harvest_segmented(body: list, page_width: float, final_total) -> dict:
     return merged
 
 
-def _verifies(sides: dict) -> bool:
-    """Does this reading reconcile against the statement's own totals?"""
+def _verifies(sides: dict, kind=None) -> bool:
+    """Does this reading reconcile against the statement's own totals? `kind`
+    applies that statement's own stricter checks when the heading names it."""
     if not sides or not _has_items(sides):
         return False
-    return check_block({"sides": sides, "kind": OTHER})["balanced"]
+    return check_block({"sides": sides, "kind": kind or OTHER})["balanced"]
 
 
 def _score_split(sides: dict, printed_total) -> tuple:
@@ -1017,8 +1130,15 @@ _SECTIONS = [
     ("EQ",  re.compile(r"shareholders?'?\s+fund|"
                        r"(?:proprietor|partners?|owner)'?s?\s+capital|"
                        r"^\s*capital\s+a/?c(?:count)?\b", re.I)),
-    ("EXP", re.compile(r"^\s*(?:[IVX]{1,4}[\s.)]+)?expenses?\s*:?\s*$", re.I)),
-    ("INC", re.compile(r"^\s*(?:[IVX]{1,4}[\s.)]+)?(?:income|revenue)\s*:?\s*$", re.I)),
+    # Prefixed by a roman numeral ("IV EXPENSES", "III. Expenses:") or a
+    # bracketed letter ("B] Expenditure :-", Borrower E' summary P&L),
+    # and "Expenditure" as well as "Expenses". Without the letter form and
+    # the word, that P&L's two sections were both just "Total" and neither
+    # could be recognised as its income or its expense side.
+    ("EXP", re.compile(r"^\s*(?:[A-Z]{1,4}\s*[\].):]\s*|[IVX]{1,4}\s+)?"
+                       r"expen(?:ses?|diture)\s*[:\-\s]*$", re.I)),
+    ("INC", re.compile(r"^\s*(?:[A-Z]{1,4}\s*[\].):]\s*|[IVX]{1,4}\s+)?"
+                       r"(?:income|revenue)\s*[:\-\s]*$", re.I)),
     # A proprietorship's own bank-format Balance Sheet routinely groups its
     # liabilities/assets under bare section captions like "SECURED LOAN :" /
     # "FIXED ASSETS :" rather than Schedule III wording, and the individual
@@ -1040,7 +1160,12 @@ _SECTIONS = [
     # template_config.py) - it must never be confused with EQ, which means
     # "this item itself is equity", or the exact overstatement bug this
     # section exists to prevent comes right back for a different token.
-    ("LIAB", re.compile(r"\bequity\s*(?:&|and)\s*liabilit", re.I)),
+    # Tally's own primary-group caption for borrowings, "Loans (Liability)",
+    # holds BOTH secured and unsecured ledgers - a generic liabilities hint,
+    # not a bucket. Without it the capital section's [EQ] context ran on
+    # down the side and filed "Secured Loans" as equity.
+    ("LIAB", re.compile(r"\bequity\s*(?:&|and)\s*liabilit|"
+                        r"^\s*loans?\s*\(\s*liabilit", re.I)),
 ]
 
 
@@ -1147,8 +1272,10 @@ def _harvest_vertical(rows: list) -> dict:
     sections, current, anchors = [], [], []
     section_token = None
     section_heading = None
+    last_derived = None     # amount of the last result row skipped (see below)
+    dangling = None         # first line of a caption wrapped onto the next row
     for _y, cells in rows:
-        cells = sorted(cells, key=lambda c: c[0])
+        cells = sorted(_split_amount_runs(cells), key=lambda c: c[0])
         # Join every label fragment on the row, don't just take the first.
         # Schedule III wraps long captions across cells, and "(a) Short - |
         # Term Borrowings" read as only "(a) Short -" loses the word that
@@ -1156,12 +1283,35 @@ def _harvest_vertical(rows: list) -> dict:
         parts = [t for _a, _b, t in cells if re.search(r"[A-Za-z]{3}", t)]
         label = re.sub(_AMOUNT_RE.pattern, "", " ".join(parts)).strip(" .:-|")
 
+        # A caption wrapped onto the next line: the first line ends on a
+        # connecting word and carries no figure ("Net Profit / Loss
+        # Transferred to" / "E] Proprietor's Capital Account 32,69,400",
+        # Borrower E). Read apart, the second half looked like a
+        # line item and the first was dropped as a heading; joined, it is
+        # the P&L's result line and is recognised as one.
+        if dangling:
+            if label:
+                label = f"{dangling} {label}"
+            dangling = None
+        if label and not any(_AMOUNT_RE.search(t.strip()) for _a, _b, t in cells) \
+                and re.search(r"(?:\b(?:to|of|and|for|from|in|on)|[&/-])\s*$", label, re.I):
+            dangling = label
+            continue
+
         is_anchor = bool(label and _ANCHOR_RE.match(label))
         amount = _current_period_amount(
             cells, cur, prior_anchor if is_anchor else prior_item)
 
         if is_anchor and amount is not None:
-            sections.append({"name": label, "items": current, "total": amount})
+            # A bare "Total" (its "(A)"/"(B)" marker is too short to survive
+            # as label text) takes the name of the heading it closes, so the
+            # P&L check can tell "Total Income" from "Total Expenditure".
+            name = label
+            if section_heading and re.fullmatch(r"\s*(?:gross\s+)?total\s*", label, re.I):
+                name = "Total " + re.sub(
+                    r"^\s*(?:[A-Z]{1,4}\s*[\].):]\s*|[IVX]{1,4}\s+)", "",
+                    section_heading).strip(" :-")
+            sections.append({"name": name, "items": current, "total": amount})
             anchors.append(amount)
             if prior_col:
                 for key, pat in _COMPARATIVE_ANCHOR_PATTERNS.items():
@@ -1209,6 +1359,14 @@ def _harvest_vertical(rows: list) -> dict:
 
         if label and amount is not None and not _SKIP_RE.match(label):
             if _DERIVED_ROW_RE.search(label):
+                last_derived = amount
+                continue
+            # The same result figure printed again a line or two further down
+            # is a restatement, not a new item. OCR set Borrower M's
+            # FY2025 profit after tax (Rs 303 lakh) a second time against
+            # "XVI Deffered Tax (Liability) - Earlier Year"; counted, it was
+            # Rs 303 lakh of deferred tax and wiped out the year's profit.
+            if last_derived is not None and abs(amount - last_derived) <= TOLERANCE:
                 continue
             if section_token:
                 label = f"[{section_token}] {label}"
@@ -1221,10 +1379,23 @@ def _harvest_vertical(rows: list) -> dict:
     return {"sections": sections, "comparative": comparative}
 
 
-def _harvest_at(rows: list, mid: float, printed_total, title_cells=None) -> dict:
-    """Harvest with the sides split at `mid`."""
+def _harvest_at(rows: list, mid: float, printed_total, title_cells=None,
+                joint: bool = False) -> dict:
+    """Harvest with the sides split at `mid`. `joint` picks both sides'
+    columns so they agree with each other rather than with `printed_total`
+    (see _harvest_combined)."""
     raw = {"left": [], "right": []}
+    page_span = max((c[1] for _y, cells in rows for c in cells), default=1) or 1
     carried = {"left": "", "right": ""}   # last label seen, for amount-only cells
+    # A figure with no usable label on its own side, waiting for the caption
+    # printed just BELOW it. Scans often set a figure one line above its
+    # caption: on a real filing (Borrower F FY2023) "8,26,44,874" sat
+    # above "Fixed Assets" and was harvested as "(unlabelled)" - Rs 8.26 crore
+    # of fixed assets then fitted no row - and "5,67,565" / "97,150" took the
+    # PREVIOUS caption instead of "Investment" / "Deposits" below them. The
+    # next caption-only cell on that side (a caption with no figure of its
+    # own) names the pending figure; any figure-bearing line cancels it.
+    pending = {"left": None, "right": None}
     section = {"left": "", "right": ""}   # last group heading, per side
 
     # Seed section context from the heading row itself (see _harvest's
@@ -1247,7 +1418,15 @@ def _harvest_at(rows: list, mid: float, printed_total, title_cells=None) -> dict
         # ("Sundry Creditors  16,950" vs "Sundry Debtors  35,260"); only the
         # label says which side of the account each one is.
         row_label, row_side = "", None
-        for x0, x1, txt in _split_cells(cells):
+        # _split_amount_runs first: a CA's depreciation working often prints
+        # the depreciation and the resulting net value fused in one cell
+        # ("LESS : DEP | 12973 116759.00"). Left whole, only its last figure
+        # was read and given the cell's LEFT edge - which sits in the
+        # gross/depreciation working column - so the net values ended up
+        # split across two columns and no set of columns reconciled (Borrower J /
+        # Borrower J FY2023: assets over by Rs 7,37,587). Split, each
+        # net value sits with the other nets and the column picker finds them.
+        for x0, x1, txt in _split_cells(_split_amount_runs(cells)):
             txt = txt.strip()
             if not txt or _SKIP_RE.match(txt):
                 continue
@@ -1259,10 +1438,11 @@ def _harvest_at(rows: list, mid: float, printed_total, title_cells=None) -> dict
                     lab = f"[{section[side]}] {lab}"
                 raw[side].append((x0, lab, parsed[1]))
                 row_label, row_side = lab, side
+                pending[side] = None
                 continue
             m = _AMOUNT_RE.search(txt)
             bare = _BARE_LONG_INT_RE.match(txt) if not m else None
-            if (m or bare) and not re.search(r"[A-Za-z]{3}", txt):
+            if (m or bare) and not _has_label_text(txt):
                 if m:
                     val = _clean_amount(m.group(1))
                     neg = _is_negative(txt, txt[:m.start()])
@@ -1273,12 +1453,29 @@ def _harvest_at(rows: list, mid: float, printed_total, title_cells=None) -> dict
                     continue
                 # Prefer this row's own label; fall back to the last section
                 # heading seen on the column's side ("Fixed Assets:").
+                #
+                # Except when the figure sits FAR across the divider from
+                # that label. The row-label rule exists for figures printed
+                # near the divider, where a liability's and an asset's
+                # columns can nearly touch. But an asset figure printed one
+                # row above its own caption lands on a row whose only label
+                # is a liability: on a real filing (Borrower F FY2023 and
+                # FY2024) "Investment 5,67,565" and "Deposits 97,150" were
+                # filed as liabilities and the assets side came up short by
+                # exactly their sum. Far across the divider, position wins.
                 use_side  = row_side or side
+                far_side  = bool(row_side and row_side != side and
+                                 abs((x0 + x1) / 2 - mid) > 0.15 * page_span)
+                if far_side:
+                    use_side, row_label = side, ""
                 use_label = row_label or carried[use_side] or "(unlabelled)"
                 if section[use_side] and not use_label.startswith("["):
                     use_label = f"[{section[use_side]}] {use_label}"
                 raw[use_side].append((x0, use_label, -val if neg else val))
-            elif re.search(r"[A-Za-z]{3}", txt):
+                # No label of its own on this side: wait for the caption below.
+                pending[use_side] = (len(raw[use_side]) - 1
+                                     if (far_side or not row_label) else None)
+            elif _has_label_text(txt):
                 heading = txt.strip(" .:-|")
                 if _LESS_DEP_RE.match(heading) and carried[side]:
                     # This reduces the PRECEDING row's asset to a net figure -
@@ -1299,12 +1496,179 @@ def _harvest_at(rows: list, mid: float, printed_total, title_cells=None) -> dict
                 token = _section_token(heading)
                 if token:
                     section[side] = token
+                # ...and names a figure printed just above it, if one is
+                # waiting (see `pending`) - but only when this caption has no
+                # figure of its own on the same row.
+                if pending[side] is not None and not any(
+                        _cell_amount(t.strip()) for _a, _b, t in cells):
+                    i = pending[side]
+                    _x, _old, amt = raw[side][i]
+                    new = f"[{section[side]}] {heading}" if section[side] else heading
+                    raw[side][i] = (_x, new, amt)
+                    pending[side] = None
 
+    if joint:
+        picked = _pick_joint(_cluster_columns(raw["left"]),
+                             _cluster_columns(raw["right"]),
+                             accept=joint if callable(joint) else None)
+        if picked is None:
+            return {"left": [], "right": []}
+        chosen = dict(zip(("left", "right"), picked))
+    else:
+        chosen = {side: _pick_columns(_cluster_columns(raw[side]), printed_total)
+                  for side in ("left", "right")}
     return {
         side: [(lab, amt) for _x, lab, amt in
-               _pick_columns(_cluster_columns(raw[side]), printed_total)]
+               _expand_groups(raw[side], chosen[side])]
         for side in ("left", "right")
     }
+
+
+def _expand_groups(entries: list, chosen: list) -> list:
+    """
+    Replace a group total with its own breakdown, when the breakdown proves it.
+
+    Tally (the accounting package most small Indian businesses use) prints
+    each primary group's TOTAL in the outer column and its ledgers in an inner
+    column beneath it:
+
+        Direct Expenses          2,00,53,326   <- chosen: outer column
+            Fuel Charges   90,60,500
+            Salary & Wages 18,27,696
+            Transport Chg  91,65,130
+
+    _pick_columns rightly chooses the outer column (it is what reconciles), but
+    stopping there loses the breakdown the spread needs: on a real filing,
+    Depreciation (81.4 lakh) and Bank Interest (32.7 lakh) sat inside
+    "Indirect Expenses" and would have been reported as zero - wrong cash
+    profit, no interest cover.
+
+    So after the columns are chosen, a chosen entry is replaced by the
+    unchosen entries that FOLLOW it, but only by the shortest run of them
+    that sums exactly (within TOLERANCE) to its amount. The side's total is
+    unchanged by construction, so the balance proof still holds; a CA's
+    working columns ("Furniture 65,980 / Less Dep 6,598 / 59,382") never sum
+    to the NEXT figure, so they are left alone.
+
+    `entries` is the side's full harvest in row order; `chosen` the subset
+    _pick_columns kept (same tuple objects).
+    """
+    keep = {id(e) for e in chosen}
+    out, i = [], 0
+    while i < len(entries):
+        e = entries[i]
+        if id(e) not in keep:
+            i += 1
+            continue
+        j, kids = i + 1, []
+        while j < len(entries) and id(entries[j]) not in keep:
+            kids.append(entries[j])
+            j += 1
+        taken, run = None, 0
+        for n, k in enumerate(kids, 1):
+            run += k[2]
+            if abs(run - e[2]) <= TOLERANCE:
+                taken = kids[:n]
+                break
+        out.extend(taken or [e])
+        i = j
+    return out
+
+
+def _pick_joint(cols_l: list, cols_r: list, accept=None):
+    """
+    Column subsets for BOTH sides at once, chosen so the two sides agree -
+    for a statement whose printed total cannot be used as the target (see
+    _harvest_combined). Fewest columns wins, so the outer (group-total)
+    columns are preferred over inner working columns.
+
+    `accept(left_entries, right_entries) -> bool` rejects agreeing readings
+    that are not the account at all. Needed, not optional: on a real Tally
+    P&L the Trading half's own closing total (Rs 3,69,85,488) is printed as a
+    lone figure on each side, and those two single-entry "columns" agree with
+    each other trivially - fewer columns than the real reading, and nothing
+    like the statement. Returns (left_entries, right_entries) or None.
+    """
+    if not cols_l or not cols_r or len(cols_l) > 8 or len(cols_r) > 8:
+        return None
+
+    def _subsets(cols):
+        for mask in range(1, 1 << len(cols)):
+            ch = [cols[i] for i in range(len(cols)) if mask >> i & 1]
+            ents = [e for col in ch for e in col]
+            yield sum(e[2] for e in ents), len(ch), ents
+
+    rights = list(_subsets(cols_r))
+    found = []
+    for sl, nl, ents_l in _subsets(cols_l):
+        for sr, nr, ents_r in rights:
+            if abs(sl - sr) <= TOLERANCE:
+                key = (nl + nr, -max(e[0] for e in ents_l) - max(e[0] for e in ents_r))
+                found.append((key, ents_l, ents_r))
+    for _key, ents_l, ents_r in sorted(found, key=lambda f: f[0]):
+        if accept is None or accept(ents_l, ents_r):
+            return ents_l, ents_r
+    return None
+
+
+# The transfer between the two halves of a combined Trading and P&L account:
+# "Gross Profit c/o" closing the Trading half, "Gross Profit b/f" opening the
+# P&L half - the same figure on both sides.
+_TRANSFER_RE = re.compile(r"gross\s+(?:pr\w{1,4}t|loss)|\b[cb]\s*/\s*[ofd]\b|\btrf\b",
+                          re.I)
+
+
+def _harvest_combined(body: list, page_width: float, title_cells=None):
+    """
+    A Trading Account and a P&L Account printed under ONE heading, with a
+    single printed "Total" that closes only the P&L half - Tally's standard
+    "Profit & Loss A/c" layout. Harvested against its printed total, the
+    Trading half can never fit; _harvest_segmented cannot split it either,
+    because Tally prints the Trading half's own closing total on two
+    different rows (left and right figures offset by a line), so no row
+    shows the equal pair it looks for. Confirmed on a real filing (Borrower L AY 2024-25): the P&L failed "short by 2.37 crore" and the year
+    reported no P&L at all.
+
+    Instead the two sides are made to agree with EACH OTHER across the whole
+    account (_pick_joint). That identity holds for the combined account -
+    the carried-down gross profit appears once on each side - and it is
+    accepted only when a matching transfer pair ("Gross Profit c/o" /
+    "Gross Profit b/f" of equal amount) is actually present, which is what
+    makes this a combined account rather than a coincidence. The agreed sum
+    becomes the block's total, the same way _harvest_segmented reports one.
+    """
+    def _has_transfer(ents_l, ents_r):
+        carried = {round(e[2]) for e in ents_l if _TRANSFER_RE.search(e[1])}
+        return any(round(e[2]) in carried
+                   for e in ents_r if _TRANSFER_RE.search(e[1]))
+
+    for divider in _divider_candidates(body, page_width):
+        sides = _harvest_at(body, divider, None, title_cells, joint=_has_transfer)
+        if not (sides["left"] and sides["right"]):
+            continue
+        sides["segmented_total"] = sum(a for _l, a in sides["left"])
+        return sides
+    return None
+
+
+def _cell_amount(text: str):
+    """
+    A cell's trailing amount, including a WHOLE-CELL bare integer with no
+    separators ("168012440"). _AMOUNT_RE alone misses the latter, which is
+    how a real filing (Borrower A FY2025, every figure printed
+    without commas) never had its closing TOTAL row recognised: the total
+    was then harvested as a line item on both sides, with the unlabelled
+    expense subtotal as a third, and the P&L failed by Rs 16.5 crore.
+    A four-digit YEAR is not accepted this way - "2024 | 2025" in a header
+    would otherwise read as a matching pair of totals 1 apart.
+    """
+    m = _AMOUNT_RE.search(text)
+    if m:
+        return _clean_amount(m.group(1))
+    b = _BARE_LONG_INT_RE.match(text)
+    if b and not (len(b.group(2)) == 4 and 1900 <= int(b.group(2)) <= 2100):
+        return float(b.group(2))
+    return None
 
 
 def _printed_total(rows: list):
@@ -1315,10 +1679,10 @@ def _printed_total(rows: list):
     statement it is the line labelled Total. (None, None) when neither reads.
     """
     for i in range(len(rows) - 1, -1, -1):
-        texts   = [t.strip() for _a, _b, t in rows[i][1]]
-        amounts = [_clean_amount(m.group(1))
-                   for t in texts if (m := _AMOUNT_RE.search(t))]
-        amounts = [a for a in amounts if a]
+        # Split first: a fused "21,84,30,367 13,42,85,686" (this year and
+        # last year in one cell) otherwise welds into one 18-digit figure.
+        texts   = [t.strip() for _a, _b, t in _split_amount_runs(rows[i][1])]
+        amounts = [a for t in texts if (a := _cell_amount(t))]
         if len(amounts) >= 2 and abs(amounts[0] - amounts[-1]) <= 2:
             return amounts[0], i
         if amounts and _TOTAL_RE.match(" ".join(texts)):
@@ -1336,9 +1700,7 @@ def _subtotal_rows(rows: list) -> list:
     out = []
     for i, (_y, cells) in enumerate(rows):
         texts   = [t.strip() for _a, _b, t in cells]
-        amounts = [_clean_amount(m.group(1))
-                   for t in texts if (m := _AMOUNT_RE.search(t))]
-        amounts = [a for a in amounts if a]
+        amounts = [a for t in texts if (a := _cell_amount(t))]
         if len(amounts) >= 2 and abs(amounts[0] - amounts[-1]) <= 2:
             out.append((i, amounts[0]))
     return out
@@ -1473,7 +1835,7 @@ def _infer_columns(rows: list) -> list:
 
     found = []
     for _y, cells in rows:
-        for x0, x1, txt in cells:
+        for x0, x1, txt in _split_amount_runs(cells):
             txt = txt.strip()
             m = _AMOUNT_RE.search(txt)
             if not m or re.search(r"[A-Za-z]{3}", txt):
@@ -1616,6 +1978,13 @@ VERIFIED   = "verified"
 UNVERIFIED = "unverified"
 FAILED     = "failed"
 
+# Wording that marks a line as income. Used only to tell whether a one-sided
+# P&L harvest carries its revenue at all (check_block); deliberately broad -
+# a false "yes" merely falls back to the old behaviour.
+_INCOME_LABEL_RE = re.compile(
+    r"^\[INC\]|revenue|\bsales?\b|turnover|receipts?\b|\bincome\b|"
+    r"\bfare\b|freight\s+(?:received|income)|commission\s+received", re.I)
+
 _UNVERIFIABLE = ("no printed total", "no section totals", "nothing to check",
                  "no grand total found",
                  "single-column statement with no printed total")
@@ -1660,6 +2029,21 @@ def check_block(block: dict) -> dict:
     if not block["sides"]["right"]:
         if printed is None:
             out["reason"] = "single-column statement with no printed total to check"
+            return out
+        # A P&L whose items sum to its printed total on ONE side can still
+        # have lost its whole income side: a T-account's debit side (expenses
+        # plus the closing profit line) sums to the account total on its own.
+        # Confirmed on a real filing (docs/SHORTCOMINGS.md Case 12): the
+        # credit-side total was unreadable, the expense side matched the
+        # printed total, and the block VERIFIED with income silently zero.
+        # A genuine single-column P&L (a Vision read of a vertical statement)
+        # still passes - its revenue lines sit in the same list.
+        if (block.get("kind") == PROFIT_LOSS
+                and not any(_INCOME_LABEL_RE.search(l)
+                            for l, _a in block["sides"]["left"])):
+            out["reason"] = ("only one side of the account was found - the "
+                             "items match the printed total but no income "
+                             "line was read, so the revenue side is missing")
             return out
         out["shortfall"] = printed - left
         out["balanced"]  = abs(out["shortfall"]) <= TOLERANCE
@@ -1785,8 +2169,17 @@ def _check_sections(block: dict) -> dict:
     # and balanced perfectly, and the block still came back VERIFIED with
     # the year's income silently reading as zero downstream.
     if block["kind"] == PROFIT_LOSS:
-        revenue = _named_total(sections, r"total\s+revenue|total\s+income\b")
-        expense = _named_total(sections, r"total\s+expenses?\b")
+        # A side's total may also be printed UNLABELLED under its heading;
+        # _harvest_vertical then names that section after the heading ("IV
+        # EXPENSES"). Accepted here too: Borrower M FY2025 printed its
+        # expense total that way and the P&L - read correctly - was
+        # rejected as "missing its expense side".
+        revenue = _named_total(sections, r"total\s+revenue|total\s+income\b|"
+                                         r"^\s*(?:[A-Z]{1,4}\s*[\].):]\s*|[IVX]{1,4}\s+)?"
+                                         r"(?:income|revenue)\s*[:\-\s]*$")
+        expense = _named_total(sections, r"total\s+expen(?:ses?|diture)\b|"
+                                         r"^\s*(?:[A-Z]{1,4}\s*[\].):]\s*|[IVX]{1,4}\s+)?"
+                                         r"expen(?:ses?|diture)\s*[:\-\s]*$")
         if revenue is None or expense is None:
             out["reason"] = ("only one side of the account was found - "
                              "sections reconcile but the statement may be "

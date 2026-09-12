@@ -83,6 +83,49 @@ _STATUS_RE = re.compile(
 )
 
 
+# ─────────────────────────────────────────────────────────────────
+# BOOK PROFIT FROM THE COMPUTATION OF INCOME
+# ─────────────────────────────────────────────────────────────────
+# The computation sheet opens its business-income head by restating the P&L's
+# own bottom line ("Net Profit / (Loss) as per profit & loss A/c (15,32,419)",
+# "Net Profit Before Tax as per P & L a/c 19,81,650", "Net Profit (Loss)
+# 5470889"). It is typed separately from the statement and usually sits on a
+# digital page, so it is a genuinely INDEPENDENT reading of the profit - unlike
+# a Vision re-read of the same statement image. Used only as a cross-check;
+# it never replaces a figure.
+
+_COMPUTATION_PAGE_RE = re.compile(
+    r"computation|profits?\s+and\s+gains\s+of\s+business|income\s+from\s+business",
+    re.I)
+
+_BOOK_PROFIT_RE = re.compile(
+    r"net\s+profit\s*(?:/\s*)?(?:\(\s*loss\s*\))?\s*(?:before\s+tax\s*)?"
+    r"(?:as\s+per\s+(?:p\s*&\s*l|profit\s*(?:&|and)\s*loss)\s*(?:a/?c|account)?\.?)?"
+    r"\s*:?\s*(\(?-?\s*\d[\d,]{2,}(?:\.\d+)?\)?)", re.I)
+
+
+def extract_book_profit(page_texts: list):
+    """
+    (profit, page_index) as restated on the computation of income, or
+    (None, None). Negative for a loss (brackets or a minus sign).
+    """
+    for i, text in enumerate(page_texts or []):
+        flat = re.sub(r"\s+", " ", text or "")
+        if not _COMPUTATION_PAGE_RE.search(flat):
+            continue
+        m = _BOOK_PROFIT_RE.search(flat)
+        if not m:
+            continue
+        raw = m.group(1).replace(" ", "")
+        val = to_int(raw)
+        if val is None:
+            continue
+        if raw.startswith("-") and val > 0:
+            val = -val
+        return val, i
+    return None, None
+
+
 def _norm_ay(m) -> str:
     """('2023', '24' | '2024') → '2023-24'."""
     start, end = m.group(1), m.group(2)

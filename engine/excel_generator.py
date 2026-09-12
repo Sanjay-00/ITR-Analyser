@@ -18,6 +18,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
+from . import analysis as A
 from .extract import financials as F
 from .mapping import taxonomy as T
 from .mapping import template_config as C
@@ -94,6 +95,7 @@ def generate_excel(columns: list) -> bytes:
     """`columns` is spread.spread_many()'s output, oldest year first."""
     wb = Workbook()
     _build_sheet(wb, columns)
+    _build_analysis_sheet(wb, columns)
     _build_audit_sheet(wb, columns)
     buf = io.BytesIO()
     wb.save(buf)
@@ -406,6 +408,77 @@ def _build_sheet(wb, columns: list) -> None:
                          "every assumption, and which statement each figure came from")
     note.font = _f(size=9, italic=True, color="808080")
     ws.merge_cells(f"A{row}:{last}{row}")
+
+
+PCT_FMT = "0.0%;-0.0%;0.0%"
+
+
+def _build_analysis_sheet(wb, columns: list) -> None:
+    """
+    Year-on-year trends and red/amber flags (see analysis.py). Separate from
+    the ITR Validation sheet so that sheet keeps matching the analyst's own
+    template row for row.
+    """
+    ws = wb.create_sheet("Analysis")
+    ws.column_dimensions["A"].width = 42
+    n = max(len(columns), 1)
+    for i in range(n):
+        ws.column_dimensions[get_column_letter(2 + i)].width = 16
+    last = get_column_letter(max(1 + n, 4))
+
+    row = 1
+    ws.merge_cells(f"A{row}:{last}{row}")
+    t = ws.cell(row=row, column=1, value=f"{borrower_name(columns)}  -  Analysis")
+    t.font, t.fill, t.alignment = _f(14, True, WHITE), _fill(NAVY), _a(indent=1)
+    ws.row_dimensions[row].height = 26
+    row += 2
+
+    ws.cell(row=row, column=1, value="Year-on-year growth").font = _f(bold=True, color=NAVY)
+    for i, col in enumerate(columns):
+        c = ws.cell(row=row, column=2 + i, value=_col_header(col))
+        c.font, c.fill, c.alignment = _f(bold=True, color=WHITE), _fill(NAVY), _a(h="center")
+    row += 1
+    for key, growth in A.trends(columns).items():
+        lbl = ws.cell(row=row, column=1, value=A.LABELS[key])
+        lbl.alignment, lbl.border = _a(indent=1), _b()
+        for i, g in enumerate(growth):
+            cell = ws.cell(row=row, column=2 + i)
+            if g is None:
+                cell.value, cell.font = "-", _f(color="808080")
+            else:
+                cell.value, cell.number_format = g, PCT_FMT
+                cell.font = _f(color=GOOD_GREEN if g >= 0 else BAD_RED)
+            cell.alignment, cell.border = _a(h="right"), _b()
+        row += 1
+
+    cg = A.cagr(columns)
+    ws.cell(row=row, column=1, value="Revenue CAGR (first to last readable year)"
+            ).alignment = _a(indent=1)
+    c = ws.cell(row=row, column=2, value=cg if cg is not None else "n/a")
+    if cg is not None:
+        c.number_format = PCT_FMT
+    row += 2
+
+    ws.merge_cells(f"A{row}:{last}{row}")
+    c = ws.cell(row=row, column=1, value="Flags")
+    c.font, c.fill, c.alignment = _f(bold=True, color=NAVY), _fill(SECTION_BG), _a(indent=1)
+    row += 1
+    fl = A.flags(columns)
+    if not fl:
+        ws.cell(row=row, column=1, value="No red or amber signals raised."
+                ).font = _f(color=GOOD_GREEN)
+    for f in fl:
+        sev = ws.cell(row=row, column=1,
+                      value=f"{f['severity'].upper()}  ·  {f['year'] or '?'}  ·  {f['flag']}")
+        sev.font = _f(bold=True, color=BAD_RED if f["severity"] == A.RED else "9C6500")
+        ws.merge_cells(f"B{row}:{last}{row}")
+        ws.cell(row=row, column=2, value=f["detail"]).font = _f(size=9)
+        row += 1
+    row += 1
+    note = ws.cell(row=row, column=1,
+                   value="Thresholds are conventional MSME comfort levels "
+                         "(engine/analysis.py THRESHOLDS) - adjust to your credit policy")
+    note.font = _f(size=9, italic=True, color="808080")
 
 
 def _build_audit_sheet(wb, columns: list) -> None:

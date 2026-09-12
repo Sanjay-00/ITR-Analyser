@@ -52,9 +52,40 @@ REL_TOL = 0.005  # 0.5%, for larger figures where ABS_TOL is too tight
 GLOBAL_SKIP_LABELS = {
     "existingmonthlyemi", "proposedloanemi", "yearlyobligationb",
     "totalb", "dscrab", "totala",
+    # The DSCR ratio row itself (main RATIOS block and Financial Snap) is a
+    # live formula over those same hand-keyed EMI cells - our sheet writes it
+    # as a formula with no cached value, so it can never be compared here.
+    "dscr",
 }
 
 KNOWN_DIVERGENCES = {
+    "Borrower L Sample Address": {
+        # 2026-09-10: the reference sheet shows a flat 0.50 lakh of Other
+        # Expenses in BOTH years; the statements' own lines (Audit Fees +
+        # Postage & Telephone + Printing & Stationery) sum to 0.522 (FY24)
+        # and 0.548 (FY25). A hand-rounded analyst figure, not an extraction
+        # gap - every other row of both years matches.
+        "skip_labels": {"otherexpenses"},
+    },
+    "Borrower A": {
+        # 2026-09-11: analyst placement choices, not extraction gaps - gross
+        # expenses and profit match in both years. The reference files this
+        # transporter's hiring charges / fuel / fastag under Purchases (other
+        # borrowers' sheets put the same costs under Transport), and counts
+        # "DIWALI EXP" (Rs 51,240 FY25) as an employee cost.
+        "skip_labels": {"purchasesrawmaterial", "employeecosts"},
+    },
+    "Borrower B": {
+        # 2026-09-11, decided by the user: "SBI EDFS loan CC" (a dealer
+        # working-capital line) is spread as Secured loan - CC/OD, not as
+        # Asset Financed as the reference sheet has it. Totals agree; these
+        # rows and the gearing ratios derived from them differ by design.
+        "skip_labels": {
+            "securedloanassetfinanced", "securedloanslongterm",
+            "longtermdebtequityinclusiveqe", "longtermdebtequityincludingqe",
+            "returnoncapitalemployed",
+        },
+    },
     "Borrower J": {
         # 2026-08-12: AY22-23 and AY24-25 source PDFs are too degraded
         # (garbled OCR / internally-inconsistent printed totals) for the
@@ -91,10 +122,22 @@ def _borrower_dirs():
 
 
 def _golden_borrowers():
+    """
+    (folder, reference workbook) per borrower. The reference is the analyst's
+    own "... ITR Validation ..." sheet, NOT simply the first .xlsx in the
+    folder: several folders also hold a Perfios FSA export
+    ("0_fsa_consolidated...") or an unrelated dedupe sheet, which sort first.
+    Picking those compared ZERO cells, so Borrower H, Borrower O and Borrower P "passed"
+    without a single figure being checked (found 2026-09-11). A folder with
+    no validation sheet is left out rather than tested against the wrong file.
+    """
     out = []
     for d in _borrower_dirs():
-        refs = glob.glob(os.path.join(d, "*.xlsx"))
-        if refs:
+        refs = sorted(glob.glob(os.path.join(d, "*.xlsx")))
+        preferred = [r for r in refs if re.search(r"validation", os.path.basename(r), re.I)]
+        if preferred:
+            out.append((d, preferred[0]))
+        elif refs and not any(re.search(r"fsa|dedupe", os.path.basename(r), re.I) for r in refs):
             out.append((d, refs[0]))
     return out
 

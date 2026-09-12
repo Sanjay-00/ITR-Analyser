@@ -26,7 +26,7 @@ sheet without a trail back to the statement it came from.
 import re
 
 from .extract import financials as F
-from .extract.itr_parser import extract_identity
+from .extract.itr_parser import extract_identity, extract_book_profit
 from .ingest import relevance
 from .mapping import taxonomy
 
@@ -166,6 +166,35 @@ def _dedupe(blocks: list, main_entity: str = "") -> list:
         kept.append(b)
         seen.update(amounts)
     return kept
+
+
+# The owner's own capital account. On the LIABILITIES side it is equity; on
+# the ASSETS side of a two-sided Balance Sheet it is a debit balance - the
+# proprietor has drawn out more than they put in.
+_CAPITAL_LINE_RE = re.compile(
+    r"\bcapital\s+a/?c(?:count)?\b|(?:proprietor|partners?|owner)'?s?\s+capital",
+    re.I)
+
+
+def _spread_items(block: dict) -> list:
+    """
+    A block's (label, amount) lines as they should enter the spread.
+
+    One adjustment: a capital account printed on the ASSETS side of a
+    two-sided Balance Sheet is negative equity, not an asset and not positive
+    equity. Confirmed against the analyst's reference sheet (Borrower A FY2024): the proprietor's capital of Rs 36.59 lakh sits among the
+    assets, and the sheet shows Equity -36.59 with both totals reduced by the
+    same amount (750.46 printed -> 713.87). Read by label alone it became
+    +36.59 of equity - the wrong sign on net worth, the one figure every
+    gearing ratio divides by. The block's own balance proof is untouched;
+    only how its lines are bucketed changes.
+    """
+    sides = block["sides"]
+    if block["kind"] != F.BALANCE_SHEET or sides.get("sections"):
+        return F.all_items(sides)
+    right = [(f"[EQ] {l} (debit balance)", -a) if _CAPITAL_LINE_RE.search(l) else (l, a)
+             for l, a in sides.get("right", [])]
+    return list(sides.get("left", [])) + right
 
 
 def _block_from_vision(obj: dict, page: int) -> dict:
@@ -386,6 +415,7 @@ def spread_document(source, extract_fn, api_key: str = None,
     text, scanned, page_texts, page_rows, page_confidence = extract_fn(source, on_progress)
 
     identity = extract_identity(text)
+    book_profit, book_profit_page = extract_book_profit(page_texts)
     pages    = relevance.select(page_texts)
 
     def _find_and_check(only_pages):
@@ -450,7 +480,7 @@ def spread_document(source, extract_fn, api_key: str = None,
                       if b["kind"] in SPREAD_KINDS and b["status"] != F.FAILED],
                      main_entity=main)
 
-    items = [it for b in usable for it in F.all_items(b["sides"])]
+    items = [it for b in usable for it in _spread_items(b)]
     learned = taxonomy.load_learned()
     buckets, unmapped, ignored = taxonomy.map_items(items, learned)
 
@@ -528,11 +558,39 @@ def spread_document(source, extract_fn, api_key: str = None,
         "assumptions":    notes,
         "mapping_check":  mapping_check,
         "comparative":    comparative,
+        "book_profit":    book_profit,
         "source_name":    getattr(source, "name",
                                   source if isinstance(source, str) else ""),
         "warnings":       _warnings(blocks, usable, unmapped, mapping_check)
-                          + _profit_crosscheck(values, ignored),
+                          + _profit_crosscheck(values, ignored)
+                          + _book_profit_crosscheck(values, book_profit,
+                                                    book_profit_page),
     }
+
+
+# The computation sheet restates profit to the rupee, but it can be the
+# profit BEFORE or AFTER a few adjustments depending on the CA's layout, and
+# it is read from whole-page text rather than a proven block. A wider
+# tolerance than _PROFIT_TOLERANCE keeps it from crying wolf on rounding.
+_BOOK_PROFIT_TOLERANCE = 1000
+
+
+def _book_profit_crosscheck(values: dict, book, page) -> list:
+    """
+    Compare our derived profit with the one the computation of income
+    restates - an independent source (typed separately, usually digital),
+    unlike a re-read of the statement image. Signed, so a loss read as a
+    profit is caught. Warns only; never changes a figure.
+    """
+    derived = values.get("profit_before_tax")
+    if book is None or derived is None:
+        return []
+    if abs(book - derived) <= _BOOK_PROFIT_TOLERANCE:
+        return []
+    return [f"Derived profit before tax ({derived:,.0f}) does not match the "
+            f"{book:,.0f} restated on the computation of income (page "
+            f"{page + 1}) - check the P&L's income and expense lines against "
+            f"the statement"]
 
 
 # The statement's printed result and our derived one should agree to the rupee;
@@ -554,11 +612,24 @@ def _profit_crosscheck(values: dict, ignored: list) -> list:
     if stated is None or derived is None:
         return []
     gap = abs(abs(stated) - abs(derived))
-    if gap <= _PROFIT_TOLERANCE:
-        return []
-    return [f"Derived profit ({derived:,.0f}) differs by {gap:,.0f} from the "
-            f"{abs(stated):,.0f} the statement itself prints - a line on the "
-            f"income or expense side has probably been misread"]
+    if gap > _PROFIT_TOLERANCE:
+        return [f"Derived profit ({derived:,.0f}) differs by {gap:,.0f} from the "
+                f"{abs(stated):,.0f} the statement itself prints - a line on the "
+                f"income or expense side has probably been misread"]
+    # Magnitudes agree, but that alone cannot see a sign flip - a Rs 43.91 lakh
+    # loss read as a Rs 43.91 lakh profit has zero magnitude gap (see
+    # docs/SHORTCOMINGS.md Case 11). The printed line's own sign is not
+    # reliable either (a T-account's closing "To Net Profit" sits on the debit
+    # side), but its WORDING is: a line that says "loss" and not "profit"
+    # names a loss outright.
+    says_loss = taxonomy.stated_is_loss(ignored)
+    if says_loss is not None and abs(derived) > _PROFIT_TOLERANCE \
+            and says_loss != (derived < 0):
+        return [f"Derived {'profit' if derived >= 0 else 'loss'} of "
+                f"{abs(derived):,.0f} has the opposite sign to the "
+                f"{'loss' if says_loss else 'profit'} the statement itself "
+                f"prints - a sign has probably been misread"]
+    return []
 
 
 # Below this, a document's "financial statements" carry no money worth
@@ -716,7 +787,7 @@ def spread_many(sources, extract_fn, api_key: str = None,
                 "blocks": [], "blocks_used": [], "values": {}, "ratios": {},
                 "unmapped": [], "ignored": [], "assumptions": [],
                 "mapping_check": {"ok": False, "diff": 0},
-                "comparative": {},
+                "comparative": {}, "book_profit": None,
                 "source_name": getattr(src, "name",
                                        src if isinstance(src, str) else ""),
                 "warnings": [f"Could not be read: {e}"],

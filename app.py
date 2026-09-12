@@ -22,7 +22,7 @@ import pandas as pd
 import streamlit as st
 
 from engine import (
-    spread, financials as F, taxonomy as T,
+    spread, financials as F, taxonomy as T, analysis as A,
     generate_excel, get_filename, ROWS, SNAP_ROWS, LAKH,
 )
 
@@ -215,8 +215,8 @@ st.download_button(
 
 st.divider()
 
-tab_docs, tab_sheet, tab_ratios = st.tabs(
-    ["📄  Documents", "📊  Spreading Sheet", "📐  Ratios"])
+tab_docs, tab_sheet, tab_ratios, tab_analysis = st.tabs(
+    ["📄  Documents", "📊  Spreading Sheet", "📐  Ratios", "🔎  Analysis"])
 
 with tab_docs:
     for col in columns:
@@ -308,3 +308,28 @@ with tab_sheet:
 
 with tab_ratios:
     st.dataframe(_ratio_df(columns), use_container_width=True)
+
+with tab_analysis:
+    summ = A.summary(columns)
+    a1, a2, a3 = st.columns(3)
+    a1.metric("Revenue CAGR", "n/a" if summ["revenue_cagr"] is None
+              else f"{summ['revenue_cagr']:.1%}")
+    a2.metric("Red flags", summ["red"])
+    a3.metric("Amber flags", summ["amber"])
+
+    tr = A.trends(columns)
+    st.caption("Year-on-year growth (%) - blank where a year is unread or not "
+               "consecutive with the one before it")
+    st.dataframe(pd.DataFrame(
+        {_col_name(c): [None if tr[k][i] is None else round(tr[k][i] * 100, 1)
+                        for k in tr] for i, c in enumerate(columns)},
+        index=[A.LABELS[k] for k in tr]), use_container_width=True)
+
+    fl = A.flags(columns)
+    if not fl:
+        st.success("No red or amber signals raised.")
+    for f in fl:
+        (st.error if f["severity"] == A.RED else st.warning)(
+            f"**{f['year'] or '?'}  ·  {f['flag']}** — {f['detail']}")
+    st.caption("Thresholds are conventional MSME comfort levels "
+               "(engine/analysis.py THRESHOLDS) - adjust to your credit policy.")

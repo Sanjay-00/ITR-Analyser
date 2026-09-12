@@ -67,6 +67,32 @@ def _digital_page(page) -> tuple:
 # wide margin, so this only ever catches a page that is actually a picture.
 _PAGE_BLANK_THRESHOLD = 20
 
+# A figure with OCR letter look-alikes inside it - "51,65,06,94g",
+# "l,06,2g,7g,ggo", "1,,33,94,6L,760". A PDF's "digital" text is not always
+# typed: a scanner app often embeds its own OCR layer, and a poor one looks
+# exactly like this. Confirmed on a real filing (Borrower I AY
+# 2023-24): the Balance Sheet and P&L pages carried such a layer, were
+# trusted as exact digital text because they were not blank, and both
+# statements failed wildly (one side read 0, a Rs 1.33 crore "Total
+# Expenses" read as Rs 55,935). Our own OCR of the page image reads them.
+_GARBLED_FIGURE_RE = re.compile(
+    r"(?<![A-Za-z])(?=[\dlIOoSgB,]*\d[\dlIOoSgB,]*\d)"
+    r"(?:[\dlIOoSgB]{1,3}(?:,{1,2}[\dlIOoSgB]{1,3}){2,})(?![A-Za-z])")
+
+
+def _looks_garbled(text: str) -> bool:
+    """Does this page's text layer look like a poor embedded OCR rather than
+    typed text? Two or more Indian-grouped figures carrying a letter or a
+    doubled comma - one could be a typo, two is the layer itself."""
+    bad = 0
+    for m in _GARBLED_FIGURE_RE.finditer(text or ""):
+        tok = m.group()
+        if re.search(r"[lIOoSgB]", tok) or ",," in tok:
+            bad += 1
+            if bad >= 2:
+                return True
+    return False
+
 
 def _extract(doc, on_progress=None) -> tuple:
     """
@@ -99,8 +125,11 @@ def _extract(doc, on_progress=None) -> tuple:
     text = _normalize_text("\n".join(page_texts))
 
     if len(text.strip()) >= ocr_extractor.SCAN_TEXT_THRESHOLD:
+        # Blank pages (a scanned image inside a digital bundle) and pages
+        # whose text layer is a garbled embedded OCR (_looks_garbled) are
+        # both read from the image instead.
         blank = [i for i, t in enumerate(page_texts)
-                 if len(t.strip()) < _PAGE_BLANK_THRESHOLD]
+                 if len(t.strip()) < _PAGE_BLANK_THRESHOLD or _looks_garbled(t)]
         if not blank:
             return text, False, page_texts, page_rows, [1.0] * len(doc)
 

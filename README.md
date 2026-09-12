@@ -61,6 +61,18 @@ total, so a dropped, duplicated or invented label is caught.
 the sheet's row schema, the label→bucket synonyms, and the judgement-call
 notes shown in the Audit Trail.
 
+**Independent cross-check.** The computation of income restates the P&L's
+bottom line ("Net Profit as per P&L a/c ..."), typed separately and usually on
+a digital page. `itr_parser.extract_book_profit` reads it and a signed
+mismatch with the derived profit is warned about - a second source that a
+Vision re-read of the same image can never be.
+
+**5 — Analysis** (`engine/analysis.py`). Year-on-year growth, revenue CAGR,
+and explainable red/amber flags (losses, eroded net worth, TOL/TNW, liquidity,
+interest cover, falling turnover, margin compression, debt outpacing
+turnover, profit contradicting the tax computation). Thresholds live in one
+`THRESHOLDS` dict. An unread year is reported as not assessable, never as 0.
+
 **4 — Page relevance** (`engine/ingest/relevance.py`). A real bundle ran to 101
 pages, of which 19 carried anything needed. Audit clauses, TDS listings and
 schedules are dropped before any expensive work.
@@ -73,7 +85,8 @@ engine/
   __init__.py                   Public API re-exported for app.py: spread, generate_excel, ...
   parser.py                     Document I/O, OCR dispatch, Gemini model cascade, debug harness
   columns.py                     Pipeline: pages -> statements -> verified blocks -> template rows
-  excel_generator.py            The ITR Validation workbook + Audit Trail sheet
+  analysis.py                   Year-on-year trends and red/amber flags over the finished columns
+  excel_generator.py            The ITR Validation workbook + Analysis + Audit Trail sheets
   ingest/                       PDF pages -> structured text
     layout.py                   Word boxes -> rows with column boundaries (OCR + digital, shared)
     ocr_extractor.py            Scanned-PDF OCR (parallel Tesseract) + Gemini Vision fallback
@@ -136,6 +149,22 @@ against real bundles in an external folder and skips cleanly without it.
 Verified end to end against real filings: the Borrower K bundles reproduce
 the analyst's own spreading sheet line for line (FY2024 with zero warnings), and
 the the CA bundle's three statements all reconcile.
+
+**Golden suite** (16 borrowers with an analyst reference sheet, no Vision,
+DSCR rows excluded). **Correction 2026-09-11:** the suite picked the first
+.xlsx in each folder, which for Borrower H, Borrower O and Borrower P was a Perfios export or
+a dedupe sheet - zero cells compared, so those three "passed" vacuously. With
+the analyst's ITR Validation sheet selected, **1,565 cells are compared and
+798 differ (about 49% cell accuracy); 2 borrowers match fully** (Borrower A,
+Borrower L). Borrower H 94/133, Borrower O 108/108, Borrower P 150/158 differ - mostly unread
+("Check ITR"), not wrong. On the 13 borrowers that were compared all along:
+mismatched rows 827 -> 682 -> 446, no borrower worse.
+About 14 of the drop are analyst conventions recorded as known divergences
+(Borrower B's EDFS loan as CC/OD, by decision; Borrower A's placement of
+hiring costs and Diwali expenses), not reading fixes. Biggest moves: Borrower A 62 -> 0, Borrower L 76 -> 0, Borrower E 56 -> 11, Borrower F 76 -> 27, Borrower J 40 -> 14.
+Still weak: Borrower N (malformed source), Borrower R (dropped scan lines),
+Borrower G (only one year's file), and statements whose expense breakdown lives
+in the schedule pages (Borrower I, Borrower E). See docs/SHORTCOMINGS.md 15-24.
 
 Known gaps:
 - Poor scans (the Borrower R bundle) lose digits to OCR; blocks correctly fail

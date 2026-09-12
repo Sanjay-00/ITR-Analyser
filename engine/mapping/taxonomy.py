@@ -48,16 +48,22 @@ IGNORE = "__derived__"
 # a credit analyst cares most about.
 _IGNORE_RE = re.compile(
     r"^\s*(?:\[[A-Z]{2,3}\]\s*)?"          # optional section-context token
+    # Stray punctuation a scan leaves before the text - the ditto marks under
+    # "To"/"By" OCR as "#", '"' or "|". "# Net profit trf to Capital A/c"
+    # (Borrower B FY24) missed this whole pattern and the year's Rs 14.46
+    # lakh profit was counted as an expense, reading profit as nil.
+    r"(?:[#\"'|*~`]+\s*)?"
     r"(?:(?:to|by)\s+)?"                   # T-account prefix: "To Net Profit"
     r"(?:[IVX]{1,4}[\s.)]+|\(?\d{1,2}\)?[\s.)]+)?"
     # Statements introduce their movement lines with "Add:" / "Less:"
     # ("Add: Profit/(Loss) for the year"), which must not hide the subtotal.
     r"(?:add\s*:?\s*|less\s*:?\s*)?"
     r"(?:total\b|gross\s+total\b|profit\s+(?:before|after|for\s+the|available)"
-    r"|(?:net\s+)?profit\s*/?\s*\(?loss\)?\b|loss\s+for\s+the"
+    r"|(?:nett?\s+)?profit\s*/?\s*\(?loss\)?\b|loss\s+for\s+the"
     # A T-account P&L closes with the period's result on whichever side
     # balances it: "Net Loss", "Net Profit c/f", "Loss transferred to Capital".
-    r"|net\s+(?:profit|loss)\b|(?:profit|loss)\s+(?:carried|transferred|c/?f)\b"
+    # "Nett" is Tally's own spelling ("Nett Profit").
+    r"|nett?\s+(?:profit|loss)\b|(?:profit|loss)\s+(?:carried|transferred|c/?f)\b"
     # A Trading Account and P&L Account sharing one combined heading close
     # the Trading half by carrying its own result down as "To Gross Profit"
     # (an expense-side plug) and reopening the P&L half with "By Gross
@@ -65,24 +71,52 @@ _IGNORE_RE = re.compile(
     # between the two halves of ONE statement, not a real expense or
     # income - counted as either it doubles the true revenue and cost by
     # exactly that amount, on a real filing by Rs 66.13 lakh each way.
-    r"|gross\s+(?:profit|loss)\b"
+    # "pr\w{1,4}t", not "profit": a scanned "Gross prfit trf to P & L A/c"
+    # (Borrower B, both years) went unrecognised, was counted as an
+    # EXPENSE, and turned a Rs 10.70 lakh profit into a Rs 31.17 lakh loss.
+    r"|gross\s+(?:pr\w{1,4}t|loss)\b"
     r"|earnings?\s+per|\bE\.?P\.?S\.?\b|basic\s*\(|diluted"
     r"|carried\s+(?:to|forward)|balance\s+(?:c/?f|b/?f)"
     r"|as\s+per\s+last\s+balance\s+sheet)", re.I)
+
+# Inside a Balance Sheet's CAPITAL section ([EQ], see financials._SECTIONS),
+# "Add: Profit for the Year" is not a restated subtotal - it is one of the
+# additions that make up closing capital, and the harvest that proved the
+# Balance Sheet counted it. Ignoring it (as the rule below does everywhere
+# else) silently cut Net Worth by the whole year's profit on a real filing
+# (Borrower L: Rs 54.71 lakh). A LOSS line is deliberately not included: a
+# CA prints "Less: Net Loss" as a positive figure to subtract, which the
+# harvest could not have summed correctly in the first place.
+_EQ_PROFIT_RE = re.compile(
+    r"^\[EQ\]\s*(?:(?:add|by|to)\s*:?\s*)?(?:nett?\s+)?profit\b", re.I)
 
 # Opening/Closing Stock inside a P&L or Trading Account (tagged [INC]/[EXP] by
 # financials.tag_pl_sides) is a Trading-Account computation input, not a
 # genuine revenue or expense line - and this template has no Opening/Closing
 # Stock row of its own. Left alone, the blanket "credit side of a P&L is
 # always income" rule below claims it: on a real filing, Closing Stock
-# inflated Sales by its own Rs 27.54 lakh. Mapped to None here (unmapped, not
-# IGNORE) so it surfaces as an excluded line with its real rupee amount
-# visible, rather than a silently wrong Sales figure - the analyst can fold
-# it into Purchases by hand if their own convention nets it there. A
-# BALANCE SHEET's own Closing Stock line is untouched: that one carries no
-# [INC]/[EXP] tag, tag_pl_sides is applied only to P&L blocks.
+# inflated Sales by its own Rs 27.54 lakh.
+#
+# It is netted into Purchases - opening stock added, closing stock deducted -
+# which is the analyst's own convention, confirmed to the rupee against a
+# reference sheet (Borrower B FY24: Purchases 1985.23 lakh = opening 44.16
+# + purchases 1960.09 - closing 19.02). The earlier choice of leaving both
+# lines unmapped excluded them from every figure, so a trading business's
+# profit came out wrong by the stock movement (Rs 37.6 lakh on that filing).
+# Profit is unchanged by the netting: closing stock leaves the income side
+# and the expense side by the same amount. A BALANCE SHEET's own Closing
+# Stock line is untouched: it carries no [INC]/[EXP] tag.
 _STOCK_MOVEMENT_RE = re.compile(
     r"^\[(?:INC|EXP)\].*\b(?:opening|closing)\s+stock\b", re.I)
+_CLOSING_STOCK_RE = re.compile(r"\bclosing\s+stock\b", re.I)
+
+
+def _mapped_amount(label: str, amount):
+    """The amount a line contributes to its bucket: a P&L's closing stock is
+    DEDUCTED from Purchases, everything else counts as printed."""
+    if _STOCK_MOVEMENT_RE.match(label.strip()) and _CLOSING_STOCK_RE.search(label):
+        return -abs(amount)
+    return amount
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -137,10 +171,27 @@ _GENERIC_TERM_RE = re.compile(
     r"opening|closing|written[\s-]*off|bad\s*debt", re.I)
 
 
-def _looks_cacheable(label: str) -> bool:
+# A run of 4+ digits in a label is an account, loan, vehicle or reference
+# number ("Axis Bank A/c 17194", "Shriram Finance Loan 7001") - identifying
+# data that must never be written to disk, and useless for the next borrower
+# anyway, whose numbers differ.
+_REFERENCE_NO_RE = re.compile(r"\d{4,}")
+
+# A T-account P&L tags its lines [INC]/[EXP] (financials.tag_pl_sides), and
+# _norm keeps those tags as a leading "inc"/"exp" word. Such a line is income
+# or expense BY POSITION, so a balance-sheet answer for it is wrong for every
+# future borrower too - one cached "inc by closing stock" -> current_assets.
+_PL_SIDE_RE = re.compile(r"^\[(?:INC|EXP)\]", re.I)
+
+
+def _looks_cacheable(label: str, key: str = None) -> bool:
     """Generic accounting/functional wording, worth remembering for the next
     borrower - as opposed to a name, a business, or a route specific to this
     one filing, which is worth nothing to cache and unsafe to keep."""
+    if _REFERENCE_NO_RE.search(label):
+        return False
+    if key in BS_LIABILITY + BS_ASSET and _PL_SIDE_RE.match(label.strip()):
+        return False
     return bool(_GENERIC_TERM_RE.search(label))
 
 
@@ -148,7 +199,15 @@ def load_learned() -> dict:
     try:
         with open(_LEARNED_PATH, encoding="utf-8") as f:
             data = json.load(f)
-        return {k: v for k, v in data.items() if v in MAPPABLE}
+        # Entries written before save_learned's filters existed are dropped on
+        # read as well, so a stale copy of the file can't reintroduce them: a
+        # reference number is identifying data, and a normalised "inc ..." /
+        # "exp ..." key is a P&L line that no balance-sheet bucket can be
+        # right for.
+        return {k: v for k, v in data.items()
+                if v in MAPPABLE and not _REFERENCE_NO_RE.search(k)
+                and not (v in BS_LIABILITY + BS_ASSET
+                         and re.match(r"(?:inc|exp)\b", k))}
     except (OSError, ValueError):
         return {}
 
@@ -159,7 +218,7 @@ def save_learned(mapping: dict) -> None:
     try:
         current = load_learned()
         current.update({_norm(k): v for k, v in mapping.items()
-                        if v in MAPPABLE and _looks_cacheable(k)})
+                        if v in MAPPABLE and _looks_cacheable(k, v)})
         os.makedirs(os.path.dirname(_LEARNED_PATH), exist_ok=True)
         with open(_LEARNED_PATH, "w", encoding="utf-8") as f:
             json.dump(dict(sorted(current.items())), f, indent=1)
@@ -178,10 +237,12 @@ def map_label(label: str, learned: dict = None):
     real categories, so letting the synonym table see it produces a confident
     wrong answer rather than no answer.
     """
+    if _EQ_PROFIT_RE.match(label.strip()):
+        return "equity_capital"
     if _IGNORE_RE.match(label.strip()):
         return IGNORE
     if _STOCK_MOVEMENT_RE.match(label.strip()):
-        return None
+        return "purchases"
     key = _norm(label)
     if learned and key in learned:
         return learned[key]
@@ -209,7 +270,7 @@ def map_items(items: list, learned: dict = None) -> tuple:
         elif target is None:
             unmapped.append((label, amount))
         else:
-            buckets[target] = buckets.get(target, 0) + amount
+            buckets[target] = buckets.get(target, 0) + _mapped_amount(label, amount)
     return buckets, unmapped, ignored
 
 
@@ -333,7 +394,7 @@ def assumptions(items: list, learned: dict = None) -> list:
 
 
 _RESULT_RE = re.compile(
-    r"(?:net\s+(?:profit|loss)|profit\s+(?:before\s+tax|for\s+the)"
+    r"(?:nett?\s+(?:profit|loss)|profit\s+(?:before\s+tax|for\s+the)"
     r"|(?:profit|loss)\s+(?:carried|transferred))", re.I)
 
 
@@ -357,6 +418,35 @@ def stated_result(ignored: list):
     return None
 
 
+def stated_is_loss(ignored: list):
+    """
+    Whether the statement's own result line names a LOSS (True), a PROFIT
+    (False), or can't be told from its wording (None - "Net Profit/(Loss)",
+    or no result line at all).
+
+    The amount's sign cannot answer this: a T-account prints its closing
+    "To Net Profit" as a plain positive figure on the debit side. The wording
+    can - and it is what the sign-flip check in columns._profit_crosscheck
+    needs, since comparing magnitudes alone passes a loss read as a profit.
+    """
+    for label, amount in ignored or []:
+        if not _RESULT_RE.search(label):
+            continue
+        low = label.lower()
+        has_profit = "profit" in low
+        has_loss = bool(re.search(r"\bloss\b", low))
+        if has_profit and has_loss:
+            # "Net Profit/(Loss)" - wording is neutral, but a printed
+            # negative is then unambiguous.
+            return True if amount < 0 else None
+        if has_loss:
+            return True
+        if has_profit:
+            return amount < 0
+        return None
+    return None
+
+
 def check_mapping(items: list, buckets: dict, unmapped: list,
                   ignored: list = (), tolerance: int = 2) -> dict:
     """
@@ -368,7 +458,9 @@ def check_mapping(items: list, buckets: dict, unmapped: list,
     totals stop agreeing and the discrepancy is reported rather than quietly
     shipped.
     """
-    harvested = sum(a for _l, a in items)
+    # Signed the same way map_items signs them (closing stock deducted), so
+    # the netting itself is not reported as money lost.
+    harvested = sum(_mapped_amount(l, a) for l, a in items)
     mapped    = (sum(buckets.values()) + sum(a for _l, a in unmapped)
                  + sum(a for _l, a in ignored))
     diff      = harvested - mapped
@@ -479,21 +571,33 @@ def ratios(v: dict) -> dict:
     # capital employed - which is how the analyst's own sheets treat it.
     lt_debt    = (_g(v, "secured_loan_asset_financed")
                   + _g(v, "unsecured_loans") + _g(v, "other_lt_liabilities"))
+    cap_emp    = networth + lt_debt
+
+    # "(inclusive q/e)" - INCLUSIVE OF QUASI-EQUITY. Unsecured loans (from the
+    # proprietor, partners, directors, relatives) are treated as the owners'
+    # own money for the two gearing ratios: added to net worth, taken out of
+    # debt. Reproduces the analyst's reference sheet exactly (Borrower L
+    # FY2024: 304.74 / (269.24 + 3.00) = 1.119 and (665.47 - 272.24) /
+    # 272.24 = 1.444); the old plain-networth version read 1.143 / 1.472 for
+    # every borrower carrying unsecured loans. Capital employed is unchanged
+    # (unsecured loans sit in it once, whichever side they are counted on).
+    quasi      = _g(v, "unsecured_loans")
+    tnw_qe     = networth + quasi
+    lt_debt_qe = lt_debt - quasi
     # Total outside liabilities is everything that is not the owners' own
     # money. Derived by subtraction rather than by adding named rows: summing
     # the rows omits whichever bucket a given filing happens to use (a deferred
     # tax liability was being left out), and the answer must not depend on
     # which row a liability lands in.
-    total_debt = _g(v, "total_liabilities") - networth
-    cap_emp    = networth + lt_debt
+    total_debt_qe = _g(v, "total_liabilities") - tnw_qe
 
     return {
         "Return on Capital Employed":              _div(pbt + interest, cap_emp),
         "Return On Share Holders Fund":            _div(pat, networth),
         "PAT / Income (%) (PAT Margin)":           _div(pat, income),
         "PAT / Assets employed (%)":               _div(pat, _g(v, "total_assets")),
-        "Long Term Debt / Equity (inclusive q/e)": _div(lt_debt, networth),
-        "Total Debt / Equity(inclusive q/e)":      _div(total_debt, networth),
+        "Long Term Debt / Equity (inclusive q/e)": _div(lt_debt_qe, tnw_qe),
+        "Total Debt / Equity(inclusive q/e)":      _div(total_debt_qe, tnw_qe),
         "Interest Coverage":                       _div(pbt + interest + _g(v, "depreciation"),
                                                        interest),
         "Current Ratio":                           _div(curr_assets, curr_liab),

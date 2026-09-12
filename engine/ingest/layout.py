@@ -1,4 +1,4 @@
-"""
+r"""
 layout.py  -  word boxes → reading-ordered rows with column boundaries.
 
 Financial statements attached to an ITR are T-accounts: Liabilities on the left,
@@ -38,6 +38,54 @@ _ROW_TOL_FRAC = 0.6
 COL_SEP = "\t"
 
 
+def _x_overlap(a0, a1, b0, b1) -> bool:
+    """Do two boxes share more than 30% of the narrower one's width? A
+    touching edge or a sliver of kerning overlap is not a stacked line."""
+    inter = min(a1, b1) - max(a0, b0)
+    return inter > 0.3 * max(min(a1 - a0, b1 - b0), 1e-6)
+
+
+# Money-shaped text: grouped digits or a paise part. Local to this module
+# (financials.py imports layout, not the other way round).
+_ROW_MONEY_RE = re.compile(r"\d[\d,]*[.,]\d{2}\b|\d{1,3}(?:,\d{2,3})+")
+
+
+def _rejoin_wrapped(rows: list, tol: float) -> list:
+    """
+    Undo the stacked-box split for a WRAPPED CAPTION, keep it for two data
+    lines.
+
+    The stacking rule in rows_with_cells puts two horizontally-overlapping
+    boxes on separate rows. That is right when both printed lines carry a
+    figure ("45,77,061.00" over "96,250.00", Borrower B) - and wrong when
+    one of them is only the second line of a long label ("(b) Total
+    outstanding dues of creditors other than micro" / "and small
+    enterprises"), which belongs with the figure on the other line. Applied
+    without this pass, a Schedule III Balance Sheet that verified before
+    (Borrower M FY2025) lost its caption/amount pairing and failed -
+    verified by re-running with and without the rule.
+
+    So adjacent rows within tolerance whose boxes overlap horizontally are
+    merged back when AT MOST ONE of them carries money - exactly the old
+    behaviour for a caption, while two money lines stay apart.
+    """
+    def _has_money(row):
+        return any(_ROW_MONEY_RE.search(t) for _a, _b, t in row[2])
+
+    out = []
+    for row in rows:
+        prev = out[-1] if out else None
+        if (prev is not None and abs(row[0] - prev[0]) <= tol
+                and not (_has_money(prev) and _has_money(row))
+                and any(_x_overlap(a, b, c, d)
+                        for a, b, _t in row[2] for c, d, _u in prev[2])):
+            prev[2].extend(row[2])
+            prev[1] += row[1]
+            continue
+        out.append(row)
+    return out
+
+
 def rows_with_cells(words, page_width: float) -> list:
     """
     `words` is an iterable of (x0, y0, x1, y1, text). Returns
@@ -61,18 +109,37 @@ def rows_with_cells(words, page_width: float) -> list:
     words.sort(key=lambda w: (w[1], w[0]))
 
     # rows: [running_mean_y, count, [(x0, x1, text), ...]]
+    #
+    # A word joins the NEAREST row within tolerance that has room for it -
+    # never a row already holding a word at the same horizontal position. Two
+    # boxes that overlap horizontally cannot sit on one printed line; they
+    # are two lines, stacked. Tightly-spaced scans put consecutive lines
+    # closer together than the tolerance, and first-fit merged them: RapidOCR
+    # returned "45,77,061.00" and "96,250.00" as SEPARATE boxes (verified),
+    # but they joined one row and then - same x - one cell,
+    # "45,77,061.00 96,250.00", losing a line from each side of the account.
+    # That is the root cause of docs/SHORTCOMINGS.md Cases 3, 6 and 21, not
+    # the OCR engine. Digital and Tesseract words never overlap on a real
+    # line, so this changes nothing for them.
     rows = []
     for x0, y0, x1, _y1, txt in words:
+        best, best_d = None, None
         for row in rows:
-            if abs(y0 - row[0]) <= tol:
-                row[0] = (row[0] * row[1] + y0) / (row[1] + 1)
-                row[1] += 1
-                row[2].append((x0, x1, str(txt).strip()))
-                break
+            d = abs(y0 - row[0])
+            if d > tol or (best_d is not None and d >= best_d):
+                continue
+            if any(_x_overlap(x0, x1, a, b) for a, b, _t in row[2]):
+                continue
+            best, best_d = row, d
+        if best is not None:
+            best[0] = (best[0] * best[1] + y0) / (best[1] + 1)
+            best[1] += 1
+            best[2].append((x0, x1, str(txt).strip()))
         else:
             rows.append([y0, 1, [(x0, x1, str(txt).strip())]])
 
     rows.sort(key=lambda r: r[0])
+    rows = _rejoin_wrapped(rows, tol)
 
     out = []
     for mean_y, _n, items in rows:
@@ -128,7 +195,8 @@ def words_from_tesseract(data: dict, min_conf: float = 30) -> list:
         if conf < min_conf:
             continue
         x, y = data["left"][i], data["top"][i]
-        words.append((x, y, x + data["width"][i], y + data["height"][i], txt))
+        words.append((x, y, x + data["width"][i], y + data["height"][i],
+                      _fix_ocr_typos(txt)))
     return words
 
 
@@ -141,9 +209,37 @@ def words_from_tesseract(data: dict, min_conf: float = 30) -> list:
 # financials.py and taxonomy.py - to also tolerate the typo.
 _OCR_TYPO_RE = re.compile(r"\bproflt\b", re.I)
 
+# An Indian-grouped amount whose separators OCR has read inconsistently -
+# "2.35.51,356.00" for "2,35,51,356.00" (Borrower B's printed Balance Sheet
+# total, a real scan). The amount grammar downstream only accepts commas as
+# group separators, so it matched just the tail "51,356.00" and the
+# statement's own total read as Rs 51,356 against Rs 2.36 crore.
+# Needs at least one 2-digit group before a 3-digit group, so a date
+# ("31.03.2024": its last group has 4 digits) and an ordinary decimal
+# ("12.345") never match.
+_MIXED_SEP_RE = re.compile(
+    r"(?<![\d.,])\d{1,3}(?:[.,]\d{2})+[.,]\d{3}(?:[.,]\d{2})?(?![\d.,])")
+
+
+def _fix_separators(m) -> str:
+    groups = re.split(r"[.,]", m.group())
+    if len(groups[-1]) == 2 and len(groups[-2]) == 3:
+        return ",".join(groups[:-1]) + "." + groups[-1]
+    return ",".join(groups)
+
+
+# A decimal point read as a comma: "5,106,21" for "5,106.21" (Borrower Q
+# Mobility's FY2026 "Total current assets", in Rs lakhs). A final group of
+# TWO digits straight after a three-digit group is never valid grouping in
+# either the Indian or the international system (both end on three digits),
+# so that last comma can only be the decimal point. Left alone, the total
+# read as 5,10,621 lakh - 100x its items - and the Balance Sheet failed.
+_DECIMAL_AS_COMMA_RE = re.compile(r"(?<![\d.,])(\d{1,3}(?:,\d{3})*,\d{3}),(\d{2})(?![\d.,])")
+
 
 def _fix_ocr_typos(txt: str) -> str:
-    return _OCR_TYPO_RE.sub("Profit", txt)
+    txt = _MIXED_SEP_RE.sub(_fix_separators, _OCR_TYPO_RE.sub("Profit", txt))
+    return _DECIMAL_AS_COMMA_RE.sub(r"\1.\2", txt)
 
 
 def words_from_rapidocr(result, min_conf: float = 0.5) -> list:
