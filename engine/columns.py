@@ -1054,10 +1054,23 @@ def spread_many(sources, extract_fn, api_key: str = None,
     # of a statement about ANOTHER year. Where the borrower's own filing for
     # the year is in the upload, that filing decides - and the comparative
     # must not be pooled ALONGSIDE it, which would add the two together.
-    for _y, (blocks, _members) in groups.items():
-        own = {b["kind"] for b in blocks if not b.get("from_comparative")}
-        blocks[:] = [b for b in blocks
-                     if not b.get("from_comparative") or b["kind"] not in own]
+    #
+    # Only a READABLE own statement outranks it, though: a year whose own P&L
+    # is broken beyond salvage takes the other printing for the whole
+    # statement instead of reading "Check ITR". And the other printing is not
+    # thrown away - it is kept apart as the year's `alternate`, so the
+    # consistency checks can compare the two printings and fill a field one of
+    # them lost from the other (engine/checks.py).
+    alternates = {}
+    for y, (blocks, _members) in groups.items():
+        own = {b["kind"] for b in blocks
+               if not b.get("from_comparative") and b["kind"] in SPREAD_KINDS
+               and (b["status"] != F.FAILED or F.salvageable(b))}
+        other = [b for b in blocks if b.get("from_comparative") and b["kind"] in own]
+        if other:
+            alternates[y] = other
+            kept_apart = {id(b) for b in other}
+            blocks[:] = [b for b in blocks if id(b) not in kept_apart]
 
     for d in docs:
         if d["blocks"]:
@@ -1091,6 +1104,10 @@ def spread_many(sources, extract_fn, api_key: str = None,
     if not cols:
         cols = [_empty_column(" + ".join(os.path.basename(str(getattr(s, "name", s)))
                                          for s in sources), [])]
+    for col in cols:
+        other = alternates.get(col["year"]) if col["year"] is not None else None
+        if other:
+            col["alternate"] = _assemble(col["year"], other, groups[col["year"]][1])
     cols.sort(key=lambda c: (c["year"] is None, c["year"] or 0))
     cols[0]["warnings"] = notes + cols[0]["warnings"]
     _recover_from_comparative(cols)

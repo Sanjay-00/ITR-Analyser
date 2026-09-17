@@ -293,3 +293,117 @@ def test_profit_into_capital_reads_an_income_and_expenditure_surplus():
     lines = [("[EQ] Excess of income over expenditure", 1445832)]
     col, t = _proprietor_col(1445832, [_capital_account(lines)])
     assert CK.profit_into_capital(col, [col], 0, t).status == "pass"
+
+
+
+# ── The same year printed twice (user scenario, 2026-09-17) ─────
+#    "ITR 2025-26.pdf" prints FY2026 with FY2025 beside it; "ITR 2024-25.pdf"
+#    prints FY2025 with FY2024 beside it. FY2025 is printed twice: both
+#    printings must agree, and a field one printing lost is taken from the
+#    other - never over a proven reading, and only when the two printings
+#    agree on their grand totals (proof they are the same statement).
+
+FINANCE = ("[EXP] (f) Finance costs", 62)
+
+
+def _pl_full(year, from_comparative=False, finance=62, revenue=95243661):
+    income = [("I. Revenue from operations", revenue), ("II. Other income", 50856)]
+    expenses = list(EXPENSES) + [("[EXP] (f) Finance costs", finance)]
+    b = _block(F.PROFIT_LOSS,
+               [_sec("Total Income", income, revenue + 50856),
+                _sec("Total expenses", expenses, sum(a for _l, a in expenses))],
+               year=year, src="ITR 2025-26.pdf" if from_comparative or year == 2026
+               else "ITR 2024-25.pdf")
+    if from_comparative:
+        b["from_comparative"] = True
+    return b
+
+
+def _two_itrs(monkeypatch, fy25_own, fy25_other):
+    cols = _spread(monkeypatch, {
+        "ITR 2025-26.pdf": _doc("ITR 2025-26.pdf", 2026, [_pl_full(2026), fy25_other]),
+        "ITR 2024-25.pdf": _doc("ITR 2024-25.pdf", 2025, [fy25_own])})
+    return {c["year"]: c for c in cols}
+
+
+def test_a_field_lost_in_one_printing_is_taken_from_the_other(monkeypatch):
+    """FY2025's own P&L lost its Rs 62 finance cost; FY2026's comparative
+    column printed it."""
+    fy25 = _two_itrs(monkeypatch, _pl(), _pl_full(2025, from_comparative=True))[2025]
+    assert fy25["values"]["interest_finance"] == 62
+    assert fy25["values"]["gross_expenses"] == 125754761
+    filled = fy25["trust"]["interest_finance"]
+    assert filled["level"] == "consistent"
+    assert "ITR 2025-26.pdf" in " ".join(filled["evidence"])
+    # A doubtful row the other printing confirms is doubtful no longer.
+    assert fy25["trust"]["purchases"]["level"] == "consistent"
+    assert _check(fy25, "Same year printed twice")["status"] == "pass"
+
+
+def test_an_unreadable_statement_is_replaced_by_its_other_printing(monkeypatch):
+    """Vice versa at statement level: FY2025's own P&L is broken beyond the
+    0.5% guard, so the other printing stands in for all of it."""
+    fy25 = _two_itrs(monkeypatch, _pl(expense_total=200000000),
+                     _pl_full(2025, from_comparative=True))[2025]
+    assert fy25["values"]["gross_expenses"] == 125754761
+    assert any(b.get("from_comparative") for b in fy25["blocks_used"])
+
+
+def test_a_proven_reading_is_never_replaced_by_the_other_printing(monkeypatch):
+    own = _pl_full(2025, finance=62)
+    own["source"] = "ITR 2024-25.pdf"
+    fy25 = _two_itrs(monkeypatch, own, _pl_full(2025, from_comparative=True, finance=999))[2025]
+    assert fy25["values"]["interest_finance"] == 62
+
+
+def test_printings_that_disagree_fill_nothing_and_fail_the_check(monkeypatch):
+    other = _pl_full(2025, from_comparative=True, revenue=195243661)   # a crore apart
+    fy25 = _two_itrs(monkeypatch, _pl(), other)[2025]
+    assert fy25["values"]["interest_finance"] == 0
+    r = _check(fy25, "Same year printed twice")
+    assert r["status"] == "fail"
+    assert "purchases" in r["implicates"] and "sales_other_income" not in r["implicates"]
+
+
+def test_same_year_twice_skips_when_a_year_is_printed_once(monkeypatch):
+    col = _spread(monkeypatch, {"s.pdf": _doc("s.pdf", 2025, [_pl()])})[0]
+    assert _check(col, "Same year printed twice")["status"] == "skip"
+
+
+
+def test_a_summary_printing_is_not_refilled_from_a_breakdown(monkeypatch):
+    """
+    Borrower E FY2024: its own balance sheet is a SUMMARY - "Current Assets
+    2,25,76,321" already contains the debtors - while FY2025's comparative
+    column prints the same year BROKEN DOWN (trade receivables 1,89,02,362
+    ...). Both agree on their totals. Filling Debtors from the breakdown while
+    the summary row still held them counted Rs 1.89 crore twice (golden: 7 ->
+    18 rows). A fill must CLOSE a gap between the two printings' totals, never
+    open one.
+    """
+    summary = _block(F.BALANCE_SHEET, [
+        _sec("Total Equity And Liabilities",
+             [("[LIAB] Capital Account", 8987926), ("[CL] Current Liabilities", 21641395)],
+             30629321),
+        _sec("Total Assets",
+             [("[NCA] Fixed Assets", 8053000), ("[CA] Current Assets", 22576321)],
+             30629321)], year=2024)
+    summary["source"] = "ITR 2024-25.pdf"
+    breakdown = _block(F.BALANCE_SHEET, [
+        _sec("Total Equity And Liabilities",
+             [("[LIAB] Capital Account", 8987926), ("[CL] (b) Trade payables", 732563),
+              ("[CL] (c) Other current liabilities", 20908832)],
+             30629321),
+        _sec("Total Assets",
+             [("[NCA] Fixed Assets", 8053000), ("[CA] (c) Trade receivables", 18902362),
+              ("[CA] (d) Cash and bank balances", 3673959)],
+             30629321)], year=2024)
+    breakdown["from_comparative"] = True
+    breakdown["source"] = "ITR 2025-26.pdf"
+    fy24 = {c["year"]: c for c in _spread(monkeypatch, {
+        "ITR 2025-26.pdf": _doc("ITR 2025-26.pdf", 2025, [breakdown]),
+        "ITR 2024-25.pdf": _doc("ITR 2024-25.pdf", 2024, [summary])})}[2024]
+    assert fy24["values"]["debtors"] == 0
+    assert fy24["values"]["sundry_creditors"] == 0
+    assert fy24["values"]["total_assets"] == 30629321
+    assert _check(fy24, "Same year printed twice")["status"] == "pass"
