@@ -407,3 +407,59 @@ def test_a_summary_printing_is_not_refilled_from_a_breakdown(monkeypatch):
     assert fy24["values"]["sundry_creditors"] == 0
     assert fy24["values"]["total_assets"] == 30629321
     assert _check(fy24, "Same year printed twice")["status"] == "pass"
+
+
+
+# ── The workbook ─────────────────────────────────────────────────
+
+def _book(cols):
+    from openpyxl import load_workbook
+    from engine import generate_excel
+    return load_workbook(io.BytesIO(generate_excel(cols)))
+
+
+def _row(ws, label):
+    return next(r for r in range(1, ws.max_row + 1) if ws.cell(row=r, column=1).value == label)
+
+
+def test_doubtful_input_rows_are_amber_with_a_note(monkeypatch):
+    cols = _spread(monkeypatch, {"s.pdf": _doc("s.pdf", 2025, [_pl(), _bs()])})
+    ws = _book(cols)["ITR Validation"]
+    cell = ws.cell(row=_row(ws, "Purchases & Raw Material"), column=2)
+    assert cell.fill.fgColor.rgb.endswith("FFEB9C")
+    assert "Section totals" in cell.comment.text
+    sales = ws.cell(row=_row(ws, "Sales and other Income"), column=2)
+    assert not sales.fill.fgColor.rgb.endswith("FFEB9C")
+
+
+def test_totals_snap_and_growth_are_never_flagged(monkeypatch):
+    """They are formulas over the input rows - flagging them too would count
+    the same doubt twice (user instruction, 2026-09-17)."""
+    cols = _spread(monkeypatch, {"s.pdf": _doc("s.pdf", 2025, [_pl(), _bs()])})
+    ws = _book(cols)["ITR Validation"]
+    for r in range(1, ws.max_row + 1):
+        label = ws.cell(row=r, column=1).value
+        value = ws.cell(row=r, column=2).value
+        if (isinstance(value, str) and value.startswith("=IFERROR")) or label in (
+                "Gross Expenses", "Profit before tax", "Profit after tax", "Cash Profit",
+                "Networth", "Total of Liabilities", "Total of Assets"):
+            assert not ws.cell(row=r, column=2).fill.fgColor.rgb.endswith("FFEB9C"), label
+
+
+def test_a_filled_row_says_where_it_came_from(monkeypatch):
+    cols = list(_two_itrs(monkeypatch, _pl(), _pl_full(2025, from_comparative=True)).values())
+    ws = _book(cols)["ITR Validation"]
+    fy25 = next(c for c in range(2, 2 + len(cols)) if ws.cell(row=3, column=c).value
+                and getattr(ws.cell(row=3, column=c).value, "year", None) == 2025)
+    cell = ws.cell(row=_row(ws, "Interest and Finance Expenses"), column=fy25)
+    assert "taken from the other printing" in cell.comment.text
+    assert not cell.fill.fgColor.rgb.endswith("FFEB9C")          # trusted, not amber
+
+
+def test_audit_trail_lists_every_check(monkeypatch):
+    cols = _spread(monkeypatch, {"s.pdf": _doc("s.pdf", 2025, [_pl(), _bs()])})
+    audit = [c.value for r in _book(cols)["Audit Trail"].iter_rows() for c in r]
+    for name in ("Section totals", "Sheet balances", "Profit vs statement",
+                 "Profit vs ITR computation", "Profit into capital account",
+                 "Same year printed twice"):
+        assert name in audit

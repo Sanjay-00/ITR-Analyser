@@ -43,6 +43,7 @@ HEAD_BG    = "DDEBF7"     # header rows and the RATIOS block
 SECTION_BG = "D6E4F0"     # Analysis / Audit Trail section bands
 TOTAL_BG   = "FFFF00"     # the analysts' yellow totals
 UNREAD_BG  = "FFC7CE"     # a figure that could not be read from the ITR
+DOUBT_BG   = "FFEB9C"     # read, but a consistency check disputes it (amber)
 BORDER_CLR = "808080"
 GOOD_GREEN = "375623"
 BAD_RED    = "C00000"
@@ -193,6 +194,37 @@ def _write_input(cell, col: dict, key: str) -> None:
 _NOTE_MAX_LINES = 25
 
 
+def _flag_trust(cell, col: dict, key: str) -> None:
+    """
+    What the consistency checks concluded about an INPUT row (engine/checks.py).
+
+    Doubtful: amber, and the note says which check disputes it and by how
+    much. Filled or confirmed from the other printing of the year: no colour -
+    the figure is trusted - but the note says where it came from.
+
+    Only rows read from the accounts are ever marked. Totals, profit lines,
+    the Financial Snap, the ratios and the growth block are formulas over
+    these rows (and never reach this function), so marking them too would
+    count the same doubt twice.
+    """
+    entry = (col.get("trust") or {}).get(key) or {}
+    lines = []
+    if entry.get("level") == "doubtful":
+        cell.fill = _fill(DOUBT_BG)
+        lines.append("Doubtful - a consistency check disputes this figure:")
+        lines += [f"- {r}" for r in entry.get("reasons", [])[:4]]
+    if entry.get("evidence"):
+        lines += [f"- {e}" for e in entry["evidence"][:3]]
+    if not lines:
+        return
+    text = "\n".join(lines)
+    if cell.comment is not None:
+        text = cell.comment.text + "\n\n" + text
+    note = Comment(text, "ITR Extractor")
+    note.width, note.height = 460, min(80 + 22 * len(lines), 360)
+    cell.comment = note
+
+
 def _source_note(lines: list) -> Comment:
     """'Added from:' then one line per source item, with page and file."""
     rows = []
@@ -256,6 +288,7 @@ def _build_sheet(wb, columns: list) -> None:
                 cell.value = _formula(C.TOTAL_FORMULAS[key], refs_for(i))
             else:
                 _write_input(cell, col, key)
+                _flag_trust(cell, col, key)
             cell.number_format, cell.alignment, cell.border = AMT_FMT, _a(h="center"), _b()
             cell.font = _f(size=11)
             if hl:
@@ -514,6 +547,29 @@ def _build_audit_sheet(wb, columns: list) -> None:
                           f"counted, and are re-derived instead"
                     ).font = _f(size=9, color="808080")
             row += 1
+
+        checks = col.get("checks") or []
+        if checks:
+            for j, head in enumerate(("Check", "Status", "Gap (lakhs)",
+                                      "Rows it could be", "Detail"), 1):
+                hc = ws.cell(row=row, column=j, value=head)
+                hc.font, hc.fill, hc.border = _f(bold=True), _fill(SECTION_BG), _b()
+            row += 1
+            for chk in checks:
+                ws.cell(row=row, column=1, value=chk["name"]).font = _f(bold=True)
+                st = ws.cell(row=row, column=2, value=chk["status"])
+                st.font = _f(bold=True, color={"pass": GOOD_GREEN, "fail": BAD_RED}
+                             .get(chk["status"], "808080"))
+                if chk["status"] == "fail":
+                    g = ws.cell(row=row, column=3, value=chk["gap"] / LAKH)
+                    g.number_format = AMT_FMT
+                ws.cell(row=row, column=4,
+                        value=", ".join(T.LABELS.get(k, k) for k in chk["implicates"])
+                        ).font = _f(size=9)
+                ws.cell(row=row, column=5, value=chk["detail"]).font = _f(size=9)
+                for cc in range(1, 6):
+                    ws.cell(row=row, column=cc).border = _b()
+                row += 1
 
         row = _source_table(ws, row, col)
 
