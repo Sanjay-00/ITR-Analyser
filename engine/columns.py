@@ -177,7 +177,7 @@ def _dedupe(blocks: list, main_entity: str = "") -> list:
     # A verified block has proved itself and is taken as-is. An unverified one
     # is admitted only if it is plainly part of the borrower's own accounts.
     candidates = [b for rivals in best.values() for b in rivals
-                  if b["status"] == F.VERIFIED
+                  if b["status"] == F.VERIFIED or b.get("salvaged")
                   or _belongs_to(b.get("entity", ""), main_entity)]
 
     kept, seen = [], set()
@@ -584,15 +584,22 @@ def _assemble(year, blocks: list, docs: list, api_key: str = None,
     identity = next((d["identity"] for d in docs if d["year"] == year),
                     docs[0]["identity"] if docs else {})
     main = _main_entity(blocks, identity)
+    # A statement that misses its own total by a hair is kept, its failing
+    # section's lines doubtful - not dropped whole (F.salvageable).
+    for b in blocks:
+        if b["kind"] in SPREAD_KINDS and b["status"] == F.FAILED and F.salvageable(b):
+            b["salvaged"] = True
     usable = _dedupe([b for b in blocks
-                      if b["kind"] in SPREAD_KINDS and b["status"] != F.FAILED],
+                      if b["kind"] in SPREAD_KINDS
+                      and (b["status"] != F.FAILED or b.get("salvaged"))],
                      main_entity=main)
 
     # Each line keeps where it came from, so every sheet figure can show the
     # lines it adds up (see `sources` below).
-    located = [(it[0], it[1], b.get("page"), b.get("source", ""))
-               for b in usable for it in _spread_items(b)]
-    items = [(l, a) for l, a, _p, _s in located]
+    located = [(it[0], it[1], b.get("page"), b.get("source", ""), level)
+               for b in usable
+               for it, level in zip(_spread_items(b), F.item_statuses(b))]
+    items = [(l, a) for l, a, _p, _s, _t in located]
     learned = taxonomy.load_learned()
     buckets, unmapped, ignored = taxonomy.map_items(items, learned)
     resolved = {}
@@ -616,7 +623,7 @@ def _assemble(year, blocks: list, docs: list, api_key: str = None,
     # {label, amount, page, file}. The workbook writes each figure as the sum
     # of these lines, so an analyst can see what makes up "CC/OD 1.35".
     sources = {}
-    for label, amount, page, src in located:
+    for label, amount, page, src, level in located:
         key = taxonomy.map_label(label, learned)
         if key is None:
             key = resolved.get(label)
@@ -626,7 +633,8 @@ def _assemble(year, blocks: list, docs: list, api_key: str = None,
             "label": re.sub(r"^\[[A-Z]+\]\s*", "", label),
             "amount": taxonomy._mapped_amount(label, amount),
             "page": None if page is None else page + 1,
-            "file": src})
+            "file": src,
+            "trust": level})
 
     # A statement we could not read must not render as a column of zeros. If
     # the P&L failed and the balance sheet passed, the P&L rows are UNKNOWN
@@ -717,6 +725,7 @@ def _assemble(year, blocks: list, docs: list, api_key: str = None,
         "mapping_check":  mapping_check,
         "comparative":    comparative,
         "book_profit":    book,
+        "book_profit_page": book_page,
         "source_name":    " + ".join(os.path.basename(str(d["source_name"]))
                                      for d in docs),
         "warnings":       ([f"{' and '.join(from_comp)} taken from the comparative "

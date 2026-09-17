@@ -2604,6 +2604,16 @@ SALVAGE_SHARE = 0.005
 _TRUST_OF = {"pass": "proven", "nototal": "consistent", "fail": "doubtful"}
 
 
+def _verdict(block: dict) -> tuple:
+    """(status, full check) for a block. The block's own status is
+    authoritative when it has one; the check is recomputed only when the
+    stored one is partial."""
+    chk = block.get("check") or {}
+    if "balanced" not in chk:
+        chk = check_block(block)
+    return block.get("status") or status_of(chk), chk
+
+
 def section_results(block: dict) -> list:
     """
     One entry per section of a vertical statement, or one for a whole
@@ -2627,8 +2637,7 @@ def section_results(block: dict) -> list:
                         "sum": got, "gap": 0 if ok else gap,
                         "status": "pass" if ok else "fail"})
         return out
-    chk = block.get("check") or check_block(block)
-    status = status_of(chk)
+    status, chk = _verdict(block)
     left, right, printed = chk["left_total"], chk["right_total"], chk["printed_total"]
     if printed is not None:
         gap = abs(left - printed)
@@ -2649,8 +2658,7 @@ def salvageable(block: dict) -> bool:
     a balance sheet's grand totals agreeing). A one-sided or badly broken
     statement is never salvaged.
     """
-    chk = block.get("check") or check_block(block)
-    if status_of(chk) != FAILED:
+    if _verdict(block)[0] != FAILED:
         return False
     results = section_results(block)
     failing = [r for r in results if r["status"] == "fail"]

@@ -86,3 +86,46 @@ def test_item_statuses_follow_their_sections():
     assert statuses == ["proven", "proven"] + ["doubtful"] * 4
     unchecked = _block(F.PROFIT_LOSS, [_sec("", [("Depreciation", 10)], None)])
     assert F.item_statuses(unchecked) == ["consistent"]
+
+
+def _doc(name, year, blocks, book_profit=None):
+    return {"source_name": name, "identity": {}, "scanned": False,
+            "book_profit": book_profit, "book_profit_page": 3 if book_profit else None,
+            "pages_total": 3, "pages_used": 2, "page_summary": {"statement": 1},
+            "blocks": blocks, "vision_pages": [], "year": year}
+
+
+def _spread(monkeypatch, docs):
+    monkeypatch.setattr(COL, "_read_document", lambda src, *a, **k: docs[src])
+    return COL.spread_many(list(docs), extract_fn=None)
+
+
+def test_a_salvaged_pl_reaches_the_sheet(monkeypatch):
+    """sample_d FY2025: before, the Rs 62 gap dropped the whole P&L and every
+    P&L row read 'Check ITR'."""
+    col = _spread(monkeypatch, {"s.pdf": _doc("s.pdf", 2025, [_pl()])})[0]
+    assert col["values"]["sales_other_income"] == 95294517
+    assert col["values"]["purchases"] == 88409944
+    assert col["blocks_used"][0].get("salvaged") is True
+
+
+def test_a_badly_broken_pl_is_still_excluded(monkeypatch):
+    col = _spread(monkeypatch, {"s.pdf": _doc("s.pdf", 2025, [_pl(expense_total=200000000)])})[0]
+    assert col["values"].get("sales_other_income") is None      # unread, as today
+
+
+def test_every_source_line_carries_its_trust(monkeypatch):
+    col = _spread(monkeypatch, {"s.pdf": _doc("s.pdf", 2025, [_pl()])})[0]
+    assert {s["trust"] for s in col["sources"]["sales_other_income"]} == {"proven"}
+    assert {s["trust"] for s in col["sources"]["purchases"]} == {"doubtful"}
+
+
+
+def test_a_block_carrying_only_its_verdict_is_understood():
+    """A statement's own status is authoritative. A block whose check dict is
+    partial - only a reason - must not crash the trust code, and must be read
+    by its status (seven pooling tests build blocks exactly like this)."""
+    b = {"kind": F.BALANCE_SHEET, "status": F.VERIFIED, "check": {"reason": ""},
+         "sides": {"left": [("Share Capital", 100)], "right": [("Fixed Assets", 100)]}}
+    assert F.item_statuses(b) == ["proven", "proven"]
+    assert not F.salvageable(b)
