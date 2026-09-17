@@ -13,11 +13,13 @@ Public API:
     python -m engine.parser <pdf> [pdf ...]      (debug harness)
 """
 
+import os
 import re
 import time
 
 import fitz  # PyMuPDF
 
+from . import cache
 from .ingest import layout
 from .ingest import ocr_extractor
 
@@ -159,14 +161,40 @@ def extract_text(pdf_source) -> str:
         doc.close()
 
 
+def _source_bytes(source) -> bytes:
+    if isinstance(source, str):
+        with open(source, "rb") as f:
+            return f.read()
+    source.seek(0)
+    return source.read()
+
+
+def _source_name(source) -> str:
+    return os.path.basename(source if isinstance(source, str)
+                            else getattr(source, "name", "") or "")
+
+
 def _extract_source(source, on_progress=None) -> tuple:
-    """Open, read and close one document. Injected into columns.py so it stays
-    independent of how documents are read."""
-    doc = _open_doc(source)
+    """
+    Open, read and close one document. Injected into columns.py so it stays
+    independent of how documents are read.
+
+    A file read before (same bytes, same reading code) comes back from the
+    cache instantly - no OCR. See cache.py.
+    """
+    data = _source_bytes(source)
+    key = cache.fingerprint(data)
+    hit = cache.get("ocr", key)
+    if hit is not None:
+        cache.mark_reused(_source_name(source))
+        return hit
+    doc = fitz.open(stream=data, filetype="pdf")
     try:
-        return _extract(doc, on_progress=on_progress)
+        result = _extract(doc, on_progress=on_progress)
     finally:
         doc.close()
+    cache.put("ocr", key, result)
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -250,12 +278,22 @@ def _llm_invoke(api_key: str, prompt) -> str:
 
 
 def vision_read(source, page_index: int, api_key: str) -> dict:
-    """Re-read one statement page from its image via the Gemini cascade."""
-    doc = _open_doc(source)
+    """Re-read one statement page from its image via the Gemini cascade.
+    A page already read by Gemini is served from the cache - never paid for
+    twice. Only a usable answer is cached; a failed call is retried next time."""
+    data = _source_bytes(source)
+    key = f"{cache.fingerprint(data)}-p{page_index}"
+    hit = cache.get("vision", key)
+    if hit is not None:
+        return hit
+    doc = fitz.open(stream=data, filetype="pdf")
     try:
-        return ocr_extractor.vision_read_page(doc, page_index, api_key, _llm_invoke)
+        result = ocr_extractor.vision_read_page(doc, page_index, api_key, _llm_invoke)
     finally:
         doc.close()
+    if result:
+        cache.put("vision", key, result)
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -266,6 +304,7 @@ def spread(sources, api_key: str = None, on_progress=None,
            use_vision: bool = False) -> list:
     """Several ITR bundles -> the spreading sheet's year columns, oldest first."""
     from .columns import spread_many
+    cache.reset_reused()
     return spread_many(sources, _extract_source, api_key=api_key,
                        invoke_fn=_llm_invoke, on_progress=on_progress,
                        vision_fn=(vision_read if use_vision else None))

@@ -15,3 +15,11 @@ samples/
 cmp_sample.py
 
 golden_vision_run.log
+
+# Cached readings of real ITRs (engine/cache.py) - same PII as the PDFs.
+data/cache/
+
+# Build artifacts from installing this repo as the itr_engine package
+# (pip install -e), used by FinSight.
+*.egg-info/
+build/
