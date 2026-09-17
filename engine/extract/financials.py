@@ -2591,6 +2591,99 @@ def status_of(check: dict) -> str:
     return FAILED
 
 
+# ─────────────────────────────────────────────────────────────────
+# PER-SECTION RESULTS AND SALVAGE  (consistency checks, stage 1)
+# ─────────────────────────────────────────────────────────────────
+# A statement used to be verified or failed as a WHOLE, and a failed one was
+# dropped - one unreadable Rs 63 line cost sample_d FY2025 every P&L row. A
+# section that misses its own printed total by at most SALVAGE_SHARE is kept
+# instead, with only its own lines marked doubtful (docs/superpowers/specs/
+# 2026-09-17-consistency-checks-design.md, section 3.3).
+SALVAGE_SHARE = 0.005
+
+_TRUST_OF = {"pass": "proven", "nototal": "consistent", "fail": "doubtful"}
+
+
+def section_results(block: dict) -> list:
+    """
+    One entry per section of a vertical statement, or one for a whole
+    T-account: {"name", "items", "total", "sum", "gap", "status"}, status
+    "pass" | "fail" | "nototal". Same rules and tolerance as _check_sections
+    (a section needs a total and at least two items to be checked), so the
+    two never disagree. Order and items align with all_items(block["sides"]).
+    """
+    sides = block["sides"]
+    if sides.get("sections"):
+        out = []
+        for s in sides["sections"]:
+            got = sum(a for _l, a in s["items"])
+            if s["total"] is None or len(s["items"]) < 2:
+                out.append({"name": s["name"], "items": s["items"], "total": s["total"],
+                            "sum": got, "gap": 0, "status": "nototal"})
+                continue
+            gap = abs(s["total"] - got)
+            ok = gap <= _tol(block, len(s["items"]) + 1)
+            out.append({"name": s["name"], "items": s["items"], "total": s["total"],
+                        "sum": got, "gap": 0 if ok else gap,
+                        "status": "pass" if ok else "fail"})
+        return out
+    chk = block.get("check") or check_block(block)
+    status = status_of(chk)
+    left, right, printed = chk["left_total"], chk["right_total"], chk["printed_total"]
+    if printed is not None:
+        gap = abs(left - printed)
+        if sides.get("right"):
+            gap = max(gap, abs(right - printed))
+    else:
+        gap = abs(left - right)
+    return [{"name": block["kind"], "items": all_items(sides), "total": printed,
+             "sum": left, "gap": gap if status == FAILED else 0,
+             "status": {VERIFIED: "pass", UNVERIFIED: "nototal"}.get(status, "fail")}]
+
+
+def salvageable(block: dict) -> bool:
+    """
+    A FAILED statement worth keeping: every failing section misses its own
+    total by at most SALVAGE_SHARE, and - with those small gaps closed - the
+    statement passes every STRUCTURAL check too (both sides of a P&L present,
+    a balance sheet's grand totals agreeing). A one-sided or badly broken
+    statement is never salvaged.
+    """
+    chk = block.get("check") or check_block(block)
+    if status_of(chk) != FAILED:
+        return False
+    results = section_results(block)
+    failing = [r for r in results if r["status"] == "fail"]
+    if not failing:
+        return False
+    for r in failing:
+        base = abs(r["total"]) if r["total"] else max(abs(r["sum"]), 1)
+        if r["gap"] > SALVAGE_SHARE * base:
+            return False
+    sides = block["sides"]
+    if sides.get("sections"):
+        failing_items = {id(r["items"]) for r in failing}
+        closed = [dict(s, total=sum(a for _l, a in s["items"]))
+                  if id(s["items"]) in failing_items else s
+                  for s in sides["sections"]]
+        return check_block(dict(block, sides=dict(sides, sections=closed)))["balanced"]
+    return bool(sides.get("left")) and bool(sides.get("right"))
+
+
+def item_statuses(block: dict) -> list:
+    """Trust of every line - "proven" | "consistent" | "doubtful" - aligned
+    with all_items(block["sides"]). A statement that is only UNVERIFIED as a
+    whole (e.g. no grand total) never makes a line more than consistent."""
+    capped = block.get("status") == UNVERIFIED
+    out = []
+    for r in section_results(block):
+        level = _TRUST_OF[r["status"]]
+        if capped and level == "proven":
+            level = "consistent"
+        out.extend([level] * len(r["items"]))
+    return out
+
+
 def check_block(block: dict) -> dict:
     """
     Returns {balanced, left_total, right_total, printed_total, shortfall, reason}.
