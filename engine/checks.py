@@ -193,7 +193,43 @@ def profit_vs_computation(col, cols, i, trust) -> CheckResult:
                        f"income{where} restates {book:,.0f}")
 
 
-CHECKS = [section_totals, sheet_balances, profit_vs_statement, profit_vs_computation]
+# The year's result, as a capital account credits it. An Income & Expenditure
+# account calls it a SURPLUS or an excess of income over expenditure - J K
+# Petroleum's "Surplus from I & E A/c" equals its P&L profit to the rupee.
+# "Agri income" and "SB Interest" on the same side are income, not the result.
+_PROFIT_LINE = re.compile(
+    r"\bprofit\b|\bsurplus\b|\bexcess\s+of\s+income\b", re.I)
+
+
+def profit_into_capital(col, cols, i, trust) -> CheckResult:
+    """
+    5. The year's profit flows into net worth: the profit a proprietor's
+    verified capital account credits must equal the P&L's profit. A P&L line
+    misread, or retained profit filed as a liability, breaks it even when
+    both statements balance. Skips unless there is exactly ONE profit line to
+    compare - a second ("Profit on sale of car") makes the match a guess.
+    """
+    name = "Profit into capital account"
+    pat = (col.get("values") or {}).get("profit_after_tax")
+    lines = [(label, amount)
+             for b in col.get("blocks") or []
+             if b.get("kind") == F.CAPITAL_ACCOUNT and b.get("status") == F.VERIFIED
+             for label, amount in F.all_items(b["sides"])
+             if _PROFIT_LINE.search(label)]
+    if pat is None or len(lines) != 1:
+        return CheckResult(name, "skip",
+                           detail="no verified capital account with a single profit line")
+    credited = abs(lines[0][1])
+    gap = abs(credited - abs(pat))
+    if gap <= _tolerance(pat):
+        return CheckResult(name, "pass")
+    return CheckResult(name, "fail", gap, _open_rows(col, trust, PL_ITEMS),
+                       f"the capital account credits a profit of {credited:,.0f}; "
+                       f"the P&L gives {abs(pat):,.0f}")
+
+
+CHECKS = [section_totals, sheet_balances, profit_vs_statement,
+          profit_vs_computation, profit_into_capital]
 
 
 def run_checks(cols: list) -> None:

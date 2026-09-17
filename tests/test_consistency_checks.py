@@ -241,3 +241,55 @@ def test_profit_vs_computation_passes_skips_and_fails():
 def test_profit_checks_never_blame_proven_rows():
     col, t = _pl_col(pbt=4000000, ignored=[("Profit before tax", 4859400)], trust="proven")
     assert CK.profit_vs_statement(col, [col], 0, t).implicates == []
+
+
+
+def _capital_account(lines, status=F.VERIFIED):
+    return {"kind": F.CAPITAL_ACCOUNT, "status": status,
+            "sides": {"left": [("To Drawings", 702324)], "right": list(lines)}}
+
+
+def _proprietor_col(pat, accounts):
+    col = {"values": {"sales_other_income": 53581608, "transport_admin": 50342494,
+                      "profit_after_tax": pat},
+           "sources": {"sales_other_income": [{"trust": "consistent"}],
+                       "transport_admin": [{"trust": "consistent"}]},
+           "blocks": accounts}
+    return col, CK.base_trust(col)
+
+
+def test_profit_into_capital_passes_and_fails():
+    """Borrower E FY2023: the capital account credits Rs 32,39,114 of profit."""
+    ok = [_capital_account([("Net Profit / Loss from Profit & loss A/c", 3239114)])]
+    col, t = _proprietor_col(3239114, ok)
+    assert CK.profit_into_capital(col, [col], 0, t).status == "pass"
+    col, t = _proprietor_col(2239114, ok)
+    r = CK.profit_into_capital(col, [col], 0, t)
+    assert r.status == "fail" and r.gap == 1000000 and r.implicates
+
+
+def test_profit_into_capital_skips_when_unsure():
+    col, t = _proprietor_col(3239114, [])                                   # no account
+    assert CK.profit_into_capital(col, [col], 0, t).status == "skip"
+    failed = [_capital_account([("Net Profit", 3239114)], status=F.FAILED)]
+    col, t = _proprietor_col(3239114, failed)                               # not verified
+    assert CK.profit_into_capital(col, [col], 0, t).status == "skip"
+    two = [_capital_account([("Net Profit", 3239114), ("Profit on sale of car", 50000)])]
+    col, t = _proprietor_col(3239114, two)                                  # ambiguous
+    assert CK.profit_into_capital(col, [col], 0, t).status == "skip"
+
+
+
+def test_profit_into_capital_reads_an_income_and_expenditure_surplus():
+    """Borrower B's capital account credits the year's result as "Surplus
+    from I & E A/c" - an Income & Expenditure account's word for profit. It
+    equals the P&L's profit to the rupee (Rs 14,45,832 FY2024), but the check
+    only knew the word "profit" and skipped. "Agri income" and "SB Interest"
+    on the same side must not be mistaken for the year's result."""
+    lines = [("[EQ] By Balance B/f", 5008887), ("[EQ] II Agri income", 424200),
+             ("[EQ] SB Interest", 181), ("[EQ] Surplus from I & E A/c", 1445832)]
+    col, t = _proprietor_col(1445832, [_capital_account(lines)])
+    assert CK.profit_into_capital(col, [col], 0, t).status == "pass"
+    lines = [("[EQ] Excess of income over expenditure", 1445832)]
+    col, t = _proprietor_col(1445832, [_capital_account(lines)])
+    assert CK.profit_into_capital(col, [col], 0, t).status == "pass"
