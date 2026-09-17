@@ -20,6 +20,15 @@ Streamlit Secrets) enables the label-classification fallback; extraction itself
 never needs it. Scanned PDFs need Tesseract (`packages.txt` covers Streamlit
 Cloud; a standard Windows install is auto-detected, or set `TESSERACT_CMD`).
 
+**Reading cache.** Every PDF's reading (OCR text and layout) and every page
+Gemini re-reads is cached in `data/cache/` (git-ignored - it holds the same
+PII as the PDFs), keyed by the file's CONTENT and a fingerprint of the reading
+code. So "Re-run with Gemini" re-reads nothing that already worked, a
+renamed or re-uploaded file loads instantly, and a Gemini page is never paid
+for twice. Changing the reading code retires old entries automatically;
+entries expire after 30 days and the cache is capped at 500 MB. Clear it from
+Settings in the app, or set `ITR_CACHE=0` to turn it off.
+
 ## The design, in one page
 
 **Don't recognise ITR formats.** Every CA package lays these out differently and
@@ -83,15 +92,24 @@ Sheet 1 is always the same **combined master format** - the union of the
 analysts' two reference layouts (`Format.xlsx` and `Validation Format-
 check.xlsx`), agreed 2026-09-12:
 
-- **P&L:** Sales, Gross Receipts; Purchases, Transport, Electricity, Employee,
+- **P&L:** Sales, Gross Receipts; Purchases, Transport, Employee,
   Other Expenses, Interest, Depreciation, Extra Ordinary; Gross Expenses; PBT;
   tax and deferred tax (entered **positive and subtracted**); PAT; Cash Profit.
+  (electricity has no row of its own - the power bill is spread with
+  Transport operation and admin charges, by decision 2026-09-16).
 - **Balance Sheet:** the ten liability rows plus **Sundry Creditors**, the
   seven asset rows plus **Debtors / Receivables**, with totals.
 - **Ratios:** ROCE, ROE, PAT/Income, PAT/Assets, LT Debt/Equity and TOL/TNW
   (both inclusive of quasi-equity), Interest Coverage, Current Ratio, DSCR,
   **Debtor Days, Creditor Days**.
-- **DSCR Calculation** (the analyst keys the EMIs) and the **Financial Snap**.
+- The **Financial Snap**, then a closing **Year-on-year growth** block -
+  live formulas, `(this year - last year) / |last year|`, so a corrected
+  figure recomputes its own growth.
+
+The DSCR Calculation block was dropped 2026-09-16 (by decision): its EMI
+rows are keyed by hand from a loan schedule, not read from any ITR. The
+DSCR ratio itself stays in the Ratios block. Sheet 1 now matches the
+analyst's own "ITR - Borrower D" workbook row for row.
 
 Figures read from the accounts are written as plain lakhs; every total,
 ratio, DSCR and Snap figure is a **live Excel formula**, defined once in
@@ -100,6 +118,13 @@ A row that could not be *read* also shows 0 so the formulas keep working, but
 is **filled red with a note** - "no income" and "income not read" must never
 look alike. Column headings say *Audited* or *Provisional* (detected from
 "PROV." headings). Sheets 2 and 3 are the Analysis and the Audit Trail.
+
+**Every figure shows where it came from.** A row built from several
+statement lines is written as their live sum (`=25+15`, in lakhs), so the
+formula bar shows what was added; the cell's note names each line with its
+page and file ("SBI Cash Credit: 25.00 (p6, ITR 2024.pdf)"). The Audit Trail
+lists every sheet row's source lines in full. The breakdown is written only
+when it adds up to the figure exactly.
 
 `tests/test_master_excel.py` evaluates the workbook's own formulas
 (`tests/xlsx_eval.py`) and checks them against the Python ratios.
@@ -198,7 +223,14 @@ About 14 of the drop are analyst conventions recorded as known divergences
 hiring costs and Diwali expenses), not reading fixes. Biggest moves: Borrower A 62 -> 0, Borrower L 76 -> 0, Borrower E 56 -> 11, Borrower F 76 -> 27, Borrower J 40 -> 14.
 Still weak: Borrower N (malformed source), Borrower R (dropped scan lines),
 Borrower G (only one year's file), and statements whose expense breakdown lives
-in the schedule pages (Borrower I, Borrower E). See docs/SHORTCOMINGS.md 15-24.
+in the schedule pages (Borrower I, Borrower E). See docs/SHORTCOMINGS.md 15-26.
+
+**After pooling uploads by financial year (2026-09-12, every borrower re-run
+one at a time):** 693 of 1,538 cells differ (**~55%**, from ~50%). Borrower H
+92 -> 28, Borrower O 108 -> 96, Borrower P 146 -> 142, Borrower Q 32 -> 31; Borrower N 104 ->
+105 (junk FY2023 figures removed, one correct figure lost on a malformed
+source); every other borrower unchanged. Borrower A and Borrower L match fully,
+Borrower K is off by one row.
 
 Known gaps:
 - Poor scans (the Borrower R bundle) lose digits to OCR; blocks correctly fail

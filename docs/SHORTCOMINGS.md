@@ -837,6 +837,48 @@ Consequences worth knowing:
   brackets (an all-zero unread column made TOL/TNW divide by zero). Both
   fixed; the unread-column test now evaluates every ratio.
 
+### 26. One case, many files: columns now pooled by each statement's own year — 2026-09-12
+
+The user uploads a whole case at once - ITR acknowledgements, separate
+financial-statement PDFs, audit reports. Read one-column-per-file, that
+produced duplicate columns, a wrongly dated column, and a column for a loan
+offer letter. `columns.spread_many` now reads every file, places each
+statement in the year its OWN period names, and `_assemble`s one column per
+year from whichever files hold it (`_dedupe` keeps the best reading and drops
+reprints). A file with no statements, or whose statements can neither be read
+nor dated, gets a note instead of a column.
+
+Found and fixed on the way, each on a real case:
+- **Borrower H (92 -> 28 rows):** "(b) Trade Payables" printed with its own
+  MSME breakdown was counted twice (`_drop_restated_parent`); a statement in
+  lakhs failed over Rs 1,000 of rounding (`_tol`, units-aware); "TotalAssets"
+  glued by OCR wasn't a total; **month-first dates** ("as at March 31, 2025")
+  were not read at all, so FY2025 filed under FY2024 once files were pooled;
+  "MAT Credit" (part of the tax charge) was unmapped; "Deferred Tax
+  Liabilty" (typo) fell to the P&L.
+- **Borrower R (regressed 78 -> 81, fixed back to 78):** page 2 of
+  the FY2025 P&L read as 2024 and moved to FY2024, losing FY2025 its
+  depreciation and interest. A statement dated to another year than its
+  file now moves only if that year does not already hold this business's
+  same statement from a file about that year - **unless its figures match**
+  (then it is a reprint, moves, and is deduped). The first version of this
+  rule, without the figures test, kept Borrower H's FY2025 reprint in FY2024 and
+  doubled that year (28 -> 35); both cases are unit-tested.
+- **File-year ties** ("ITR 2022-2023.pdf" held one FY2023 and one FY2024
+  statement) are broken by the return's Assessment Year, not set order.
+- **Borrower O (108 -> 96 rows):** each bundle carried the OTHER year's
+  accounts ("ITR 23-24.pdf" = AY 2024-25 acknowledgement + Balance Sheet "as
+  on 31.03.2023" + undated P&L). An undated statement now takes the period of
+  the nearest dated statement in the same file (`_infer_missing_years`)
+  before falling back to the ITR's year.
+
+**Still open (analyst conventions, not reading errors):** Borrower H's FY2024
+reference uses the RESTATED comparatives from the FY2025 accounts; its FY2025
+reference moves current maturities of long-term debt (from the notes) into
+Secured Loans. Borrower H FY2024's scanned P&L sets the Operating Expenses figure
+on the "II Expenses" heading line (a figure-above-its-caption offset in a
+vertical statement) - totals verify, the Transport/Other split does not.
+
 ## Template for new cases
 
 ```
@@ -847,3 +889,362 @@ Consequences worth knowing:
 **What needs improvement:** ...
 **Mitigation:** ...
 ```
+
+### 27. Schedule pages were never read — ADDED 2026-09-12
+
+**Ground truth:** a proprietorship's P&L face often prints only group lines -
+Borrower E FY2023: "Direct Expenses (Sch 8) 4,69,84,240",
+"Indirect Expenses (Sch 9) 22,69,814". The salary (2.88 cr), the loan
+interest and the transport charges are on the schedule pages behind them.
+Read from the face alone, Employee Costs and Interest were zero (no interest
+cover) and every rupee of wages was spread as transport.
+
+**What changed:** `financials.find_schedules` reads every numbered schedule
+or note ("Sch 08 Direct Expenses", "Note 15 : ...", "Schedule H : Expenses")
+as one entry per group - a heading may hold several groups, each under its
+own caption and closed by its own Total (Borrower I's Schedule H is Direct
+then Indirect). A group is trusted only when its lines sum to that Total.
+`expand_with_schedules` then replaces a P&L GROUP line (direct / indirect /
+operating / administrative / establishment ... expenses - never "Other
+expenses") with its schedule's lines, only when the schedule's total equals
+the line's amount and a name word matches. A schedule line the face also
+prints on its own (Borrower I's Depreciation, inside Indirect expenses AND on
+the P&L) is dropped only when such lines account for the whole difference.
+The block's totals are unchanged by construction.
+
+Also: ESIC / PF contributions map to Employee Costs (not a "PF Payable"
+liability); "Repairs and Maintenance" and the misspelt "Disel" map to
+Transport, like their singular / correct forms already did.
+
+**Result:** Borrower E 11 -> 7 rows, Borrower I 55 -> 49.
+
+**Still open:**
+- Analyst conventions on small lines: Borrower E's analyst puts Telephone,
+  Professional Fees, Conveyance and PT into Transport & Admin and
+  Refreshment into Employee; the general rules keep them in Other Expenses.
+- Balance-sheet schedules are read but not expanded. The two analysts
+  disagree: Borrower E's spreads ALL loans (incl. 78 lakh unsecured and a 1 cr
+  Cash Credit) as Asset Financed; Borrower I's splits Schedule B into Asset
+  Financed / CC-OD / Unsecured (~18 rows). Needs a decision, not a rule.
+- Borrower I FY2023: the Balance Sheet (p30) fails its check - a scan issue.
+
+### 28. One unreadable rupee figure failed a whole P&L — FIXED 2026-09-16
+
+**The filing:** Borrower D FY2025 (a 2-page scanned Schedule III set).
+Page 1's P&L failed, so EVERY P&L row of that year read "Check ITR".
+
+**Ground truth (page 1):** "(f) Finance costs | 30 | 63 | 1,25,03,233" - a
+real Rs 63 finance cost beside its Note No. 30. The four expense lines that
+WERE read sum to 12,57,54,699 against a printed 12,57,54,761: short by 62.
+(The filing's own total is off by Re 1; that is inside TOLERANCE.)
+
+**Root cause:** `_AMOUNT_RE` takes a bare integer only when it is exactly 3
+digits, so that "Note 25" is never harvested as Rs 25. A genuinely small
+amount is indistinguishable by digit count, so the row carried no amount at
+all, was taken for a heading and dropped - and the section then failed by
+exactly that figure.
+
+**Fix:** statement columns are RIGHT-ALIGNED. `_period_right_edge` takes the
+median right edge of the figures already readable without ambiguity, and a
+bare 1-2 digit cell is admitted only when it ends there (the Note No. column
+ends far to the left). Digit count decides nothing; position does.
+
+**Two more bugs the same file exposed, all one wording:** Schedule III spells
+trade payables as two line items that OPEN with "total" ("total outstanding
+dues of micro ...", "... of creditors other than micro and small
+enterprises"). Three separate layers each read that as a total row:
+- `_ANCHOR_RE` closed the Current liabilities section on it: the Rs 4.32
+  crore payables became a section total with no items, and every line BELOW
+  it lost its [CL] tag - so "(c) Current tax liabilities (net)", a balance
+  sheet liability, was spread as the P&L's current tax expense and the loss
+  was overstated by Rs 66.75 lakh.
+- `_SKIP_RE` then discarded the row as structure.
+- `taxonomy._IGNORE_RE` set it aside as a restatement, so Rs 432.25 lakh of
+  creditors never reached the sheet.
+Each now carries the same `(?!\s+outstanding\s+dues)` exception; a real
+"Total ..." row is still an anchor, still skipped, still ignored.
+
+**Result:** both statements verify. Every row matches the printed statement -
+Revenue 952.95, PBT -304.60, PAT -290.91 (was -357.67), Sundry Creditors
+432.25 (was 0.00), and Total of Liabilities = Total of Assets = 1,660.13
+(the liabilities side was Rs 499 lakh short before). Borrower E, the one borrower
+whose reading is cached, is unchanged at 7 rows.
+
+**Still open on this file:** the EPS line "(1) Basic (2,909.11)" is harvested
+and then reported as unclassifiable (-2,909). It is excluded from every
+figure, so nothing is wrong in the sheet - but the warning is noise, and
+`_IGNORE_RE`'s "basic (" pattern does not match this "(1) Basic" spelling.
+
+### 29. A provisional set: two files, one year, and a two-digit year — FIXED 2026-09-16
+
+**The filing:** Borrower D' provisional set - one file holding the
+Provisional Balance Sheet "as at 31st March, 2026", another holding the
+"PROVISIONAL PROFIT AND LOSS ACCOUNT FOR THE YEAR ENDED 31.03.26". Both
+digital, both one page.
+
+**What happened:** they came out as TWO columns - an FY2026 balance sheet
+with no P&L, and an undated P&L with no balance sheet, side by side.
+
+**Root cause:** `_PERIOD_RE` requires a FOUR-digit year. "31.03.26" matched
+nothing, so the P&L had no period at all and could not be pooled with the
+balance sheet for the same year. `_find_period` now widens a two-digit year
+inside a complete numeric date (`_widen_short_year`); a bare two-digit
+number is still never a year.
+
+**Result:** one FY2026 column, both statements verified, every figure equal
+to the printed statement (Revenue 902.89, PBT 15.82, PAT 6.61, Creditors
+132.25, Total 1,392.84 on both sides).
+
+### 30. The comparative column is now a year of its own — NEW CAPABILITY 2026-09-16
+
+Case 14 harvested the comparative column's GRAND TOTALS and used them only
+to rescue a year whose own statement failed. But a Schedule III statement
+prints last year beside this year LINE FOR LINE, and a case often arrives
+with no file for that year at all - sample_d's provisional set is FY2026 only,
+yet carries the whole of FY2025.
+
+`_harvest_vertical` now reads the prior column line by line (including rows
+that are nil this year and real last year - "(b) Deferred tax | - |
+(13,69,133)"), and `find_blocks` emits it as a statement of the PRIOR year,
+marked `from_comparative`. It is checked against its own printed totals like
+any other statement, and `spread_many` keeps it only where that year has no
+statement of its own OF THAT KIND - the borrower's own filing always wins,
+and the two are never pooled together (which would add them). Every such
+column carries a warning and an Audit Trail note.
+
+**Validated against the audited filing:** FY2025 read from the provisional
+set's comparative column matches sample_d's own audited FY2025 statements to
+the rupee on every row - Revenue 952.95, Purchases 884.10, Employee 44.36,
+Depreciation 119.63, Other 209.45, PBT -304.60, PAT -290.91, Creditors
+432.25, Total Assets 1,660.13, Net Worth 33.72.
+
+**Caveat kept from Case 14:** a later auditor can reclassify figures between
+buckets, so a comparative-derived column is the weakest reading of a year -
+hence the warning, and hence a real filing always displacing it.
+
+**Not yet measured:** the golden suite has NOT been re-run for the other 14
+borrowers (2 GB free RAM; the runs keep being killed). This adds prior-year
+columns only where a year has no statement of its own - Borrower G FY2024 and
+Borrower I FY2023 are the likely movers. Borrower E, whose reading is cached, is
+unchanged at 7 rows.
+
+### 31. Electricity row removed; current liabilities confirmed — DECISION 2026-09-16
+
+By the user's decision:
+- The **Electricity** row is gone from the sheet. "Electricity", "Light
+  Bill", "Power & Fuel", "MSEB"/"MSEDCL" now map to Transport operation and
+  admin charges, so the money stays in Gross Expenses and profit is
+  unchanged. The analysts' reference sheets still carry the row, so the
+  golden suite folds THEIRS into transport the same way - otherwise the same
+  rupees would count twice as a divergence.
+- **Current Liabilities and Provision** = current tax liabilities + other
+  current liabilities (+ any other current-liability line). Trade payables
+  keep their own **Sundry Creditors** row, so Creditor Days still works.
+  Nothing current is placed in **Secured loan maturity within one year**:
+  only the wording "current maturities ..." reaches that row.
+
+Verified on sample_d FY2026: Sundry Creditors 132.25 (trade payables),
+Current Liabilities and Provision 243.21 (other current 171.95 + current tax
+71.26), Secured loan maturity within one year 0.00, Total of Liabilities =
+Total of Assets = 1,392.84. Borrower E is unchanged at 7 rows.
+
+### 32. The workbook titled itself after the borrower's address — FIXED 2026-09-16
+
+**Ground truth:** Borrower D' statements head with the company name,
+its CIN, then the address, then the heading:
+
+    Borrower D
+    (CIN: U35120MH2008PTC182130 )
+    6-A, H & G House, Sector 11, C B D Belapur, Navi Mumbai, ... 400614
+    Provisional Balance Sheet as at 31st March, 2026
+
+**What happened:** the entity read as the ADDRESS line, so every column, the
+workbook title and the download filename carried it instead of the company.
+
+**Root cause, in two layers:**
+- `_ADDRESS_RE` is a keyword list (road, nagar, marg, building ...) and this
+  address uses none of them - it has "House", "Sector" and place names. So
+  `_find_entity` never skipped it. An address also has a SHAPE a business
+  name does not: a six-digit PIN code, or several comma-separated locality
+  parts. Either now identifies one on its own.
+- `_main_entity` had already REJECTED the line (`_belongs_to` caps a name at
+  70 characters), but `_assemble`'s fallback took the first block's entity
+  whatever it was, so the rejected line still titled the column. The fallback
+  now applies the same screen.
+
+**Result:** both sample_d sets title as Borrower D, and
+the filename follows. Borrower E is unchanged at 7 rows; the borrower names in
+the golden set (including "Borrower A", which carries an address
+WORD) are unaffected.
+
+### 33. A statement printed across two pages — FIXED 2026-09-16
+
+**The filing:** A CUSTOMER FY2026, a Tally set. Both statements run
+onto a second page, bridged by Tally's own devices:
+
+    P&L   page 1 ... Nett Profit 1,76,75,079.92 / "continued ..."
+          page 2     Total 3,01,32,082.59 | Total 3,01,32,082.59
+    BS    page 3 ... Carried Over 14,98,54,659.78 | Carried Over 6,06,57,088.80
+          page 4     Brought Forward (the same two figures), Current Assets ...,
+                     Total 14,98,54,659.78 | Total 14,98,54,659.78
+
+**Root cause:** `find_blocks` assumed a statement is printed whole on one
+page ("a page boundary also ends a block"). So the first half of the Balance
+Sheet could never balance - its assets continue overleaf - and the second
+half read as a separate statement whose two "Brought Forward" lines (Rs 21.05
+crore) fitted no row. On the P&L the break cost the entire Indirect Expenses
+block (Rs 1.24 crore, including Rs 86.98 lakh of employee cost): its only
+real Total sits overleaf, so `_harvest_segmented` had nothing to check the
+second half against and the harvest stopped at the trading total. Profit read
+Rs 292.50 lakh against a printed Rs 176.75 lakh. NOT an OCR fault - Vision
+re-reads the same page and cannot see the other one either.
+
+**Fix:** `_join_continuations` joins a statement across either bridge -
+Carried Over / Brought Forward, or "continued ..." with the heading
+reprinted overleaf - dropping the bridge rows (they restate what is already
+above) and emptying the continuation page so it keeps its number. Two
+statements merely printed back to back have neither bridge and stay separate.
+
+**And two mapping bugs it exposed - one principle:** a line's SECTION TAG
+now outranks its wording (`taxonomy._blocked_targets`).
+- "[EQ] Interest Paid On Housing Loan" is a movement inside the capital
+  account, not the P&L's interest: equity was short Rs 8.82 lakh.
+- "[EXP] Sales & Commission" is an expense, not revenue: income overstated
+  Rs 1.45 lakh and the cost lost - Rs 2.90 lakh of phantom profit.
+A balance-sheet line can no longer map to any P&L bucket, a debit line can
+never be income, and a credit line can never be a cost.
+
+**Result:** every figure matches the printed statements - Sales 1,850.17,
+Employee Costs 86.98, PAT 176.75, Equity 490.42, Creditors 659.33, Debtors
+835.18, and Total Liabilities = Total Assets = 1,498.55. Both statements
+verify with no warnings. Borrower E unchanged at 7 rows; both sample_d sets
+unchanged and still balancing.
+
+### 34. Retained profit filed as a current liability — FIXED 2026-09-16
+
+Found while checking case 33's Balance Sheet row by row. Tally lists its
+primary groups down the liabilities side:
+
+    Capital Account        4,90,42,016.76
+    Loans (Liability)      1,58,46,361.47
+    Current Liabilities    6,72,91,201.63
+      Provisions             13,58,431.00
+      Sundry Creditors     6,59,32,770.63
+    Profit & Loss A/c      1,76,75,079.92      <- a group of its own
+      Current Period       1,76,75,079.92
+
+"Profit & Loss A/c" was not recognised as a heading, so the [CL] context from
+Current Liabilities ran on: the year's retained profit was tagged
+"[CL] Current Period" and spread as a CURRENT LIABILITY. Current Liabilities
+read Rs 190.34 lakh against a printed Rs 13.58, Reserves read 0, and Net
+Worth was Rs 176.75 lakh short.
+
+**The Balance Sheet still balanced** - Total Liabilities and Total Assets
+both 1,498.55 - which is exactly why the arithmetic proof cannot catch this
+class of error, and the section tag must. Added to `_SECTIONS` as [EQ].
+
+**Result:** Equity 667.17 (capital 490.42 + retained profit 176.75), Current
+Liabilities 13.58, Net Worth 667.17, both totals still 1,498.55 - every row
+of both statements now equal to the printed figures. Borrower E unchanged at 7
+rows; both sample_d sets unchanged (their equity/reserves split is untouched,
+Schedule III naming its own sections).
+
+### 35. Sheet 1 matched to the analyst's quick-analysis layout — DECISION 2026-09-16
+
+Audited the analyst's filled workbook ("ITR - Borrower D.xlsx") row by row - name, values, formulas. It IS our own output
+(the `=274.62735+57.97803+492.79707` cells are our source-breakdown), with
+two edits, both now adopted:
+
+- the **DSCR Calculation** block removed: its Existing/Proposed EMI rows are
+  keyed by hand from a loan schedule, not read from any ITR. The DSCR ratio
+  stays in the Ratios block;
+- a closing **Year-on-year growth** block added, as live formulas
+  `=(C6-B6)/ABS(B6)` in the analysts' own percent format.
+
+Sheet 1 now reproduces that workbook exactly: 92 rows, identical labels,
+zero value differences across all three years (FY2024, FY2025 audited,
+FY2026 provisional). Analysis and Audit Trail remain as sheets 2 and 3 -
+nothing is lost.
+
+**Kept deliberately:** Interest Coverage still prints its real value even
+when it is absurd - FY2025 reads -293,599.76 because that year's interest is
+Rs 63. By decision: show everything, hide nothing.
+
+**Also checked in that audit:** every formula (ROCE, TOL/TNW with unsecured
+loans as quasi-equity, Current Ratio, Cash Profit, Debtor/Creditor Days on
+turnover) matches the analysts' definitions, and both totals balance each
+year.
+
+### 36. Two regressions the audit caught — FIXED 2026-09-17
+
+A deep audit before committing re-ran the golden borrowers. Two had got
+WORSE since the last full run, both from changes made the day before.
+
+**(a) Borrower A: a full match -> 28 rows wrong.** Case 34 taught
+the harvester that Tally's "Profit & Loss A/c" group is equity. True on the
+LIABILITIES side (A CUSTOMER' retained profit) - but Borrower A prints
+"PROFIT & LOSS" 310.29 lakh among its ASSETS, an accumulated loss carried as
+an asset, which its analyst keeps in current assets. Read as equity it moved
+Rs 310.29 lakh across the sheet: equity 273.70 against a printed -36.59, both
+totals out by the same. Fixed by making it side-aware (`_PL_GROUP_RE`): the
+group is read as equity only on a side that has already shown equity or
+liability groups, never on the assets side.
+
+**(b) Borrower B: 11 -> 45 rows wrong.** A petrol pump prints its Trading
+("PUMP ACCOUNT") and its Profit & Loss on ONE page. Both are profit_loss,
+neither names an entity, so both share `_dedupe`'s (entity, kind, year) key -
+and only the "best" was kept. FY2025 lost its whole trading account: income
+read Rs 21.71 lakh against Rs 1,659.38 printed.
+
+It had worked before only by accident: the P&L block's "entity" used to be a
+misread DATA row ("Gross prfit trf to P&I 41,86,923.00 ..."), which differed
+from the other block's, so both survived. Case 32's address test correctly
+rejects that junk - and exposed the real defect underneath. `_dedupe` now
+treats same-key blocks as rivals only when their FIGURES overlap; two
+complementary statements both survive, while a reprint is still dropped.
+
+**After both fixes:** J K 11 -> 8, Borrower A back to a full match, Borrower G
+52 -> 22 (its FY2024 now read from the following year's comparative column),
+Borrower E 11 -> 7. Borrower K 1, Borrower L full match, Borrower J 14, Borrower Q 31, Borrower F 27 -
+all unchanged.
+
+**Lesson:** an accidental pass is worth as little as an accidental failure.
+Both bugs here were structural (same key, wrong side), and both left the
+statement balancing - only the golden comparison caught them.
+
+### 37. A year lost to punctuation took its whole comparative year with it — FIXED 2026-09-17
+
+**The filing:** A CUSTOMER AY2025-26, a digital Schedule III set. The
+P&L (page 1) and Balance Sheet (page 2) both print FY2025 beside FY2024, line
+for line. The sheet got FY2024's Balance Sheet but no FY2024 P&L.
+
+**Root cause:** the P&L heading reads "Profit & Loss A/c as on 31st, March ,
+2025". `_PERIOD_RE` allowed one separator between the day and the month and
+refused the comma, so the P&L had NO year. A comparative column is emitted as
+the prior year's statement only when the statement's own year is known - so
+the entire FY2024 P&L (revenue 1,147.08 lakh, PAT 36.97) was never produced.
+The Balance Sheet, dated cleanly on the next page, did produce its FY2024
+column, which is why the year was half there.
+
+**Fixed in layers, not just the comma:**
+1. Heading dates tolerate any run of spaces and commas around the separator.
+2. **A statement's own column headers are a second source of its years**
+   (`_header_years`) - "2025 | 2024", "As at 31st March, 2025", read above the
+   first figure only. A heading with no date at all, or one the pattern
+   cannot parse, still gets its year, and the comparative takes the header's
+   second year when one is printed.
+3. Two-digit years are widened after a month NAME too ("1-Apr-25").
+
+**The first version of (2) regressed a borrower, caught by the golden set:**
+Tally heads statements with the period as a RANGE, "1-Apr-2023 to
+31-Mar-2024". Read year by year, the range's START was taken and Borrower L's FY2024 statements were dated 2023 - a full match turned into 69 rows
+off. Within a cell stating a range, only the END year counts; separate cells
+remain separate columns.
+
+**Result:** YES AY2025-26 yields both years, every row equal to the printed
+statement - FY2024 revenue 1,147.08, PBT 39.45, tax 2.48, PAT 36.97, assets
+518.35; FY2025 revenue 1,426.48, PAT 33.66, assets 1,063.02. Borrower L back to a
+full match; Borrower E 7, Borrower A full match, J K 8, Borrower K 1, Borrower J 14, Borrower G
+22 - all unchanged. **Also corrected:** YTM (case 33) is now dated FY2026, the
+year its "1-Apr-25 to 31-Mar-26" statements actually end in - it had been
+shown as FY2025.
