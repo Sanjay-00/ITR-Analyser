@@ -129,3 +129,79 @@ def test_a_block_carrying_only_its_verdict_is_understood():
          "sides": {"left": [("Share Capital", 100)], "right": [("Fixed Assets", 100)]}}
     assert F.item_statuses(b) == ["proven", "proven"]
     assert not F.salvageable(b)
+
+
+
+from engine import checks as CK                                       # noqa: E402
+
+
+def _bs(capital=1000000, loans=2000000, fixed=1500000, debtors=1500000, year=2025):
+    """A verified Schedule III balance sheet."""
+    return _block(F.BALANCE_SHEET, [
+        _sec("Total Equity And Liabilities",
+             [("[LIAB] (a) Equity share capital", capital), ("[NCL] (i) Borrowings", loans)],
+             capital + loans),
+        _sec("Total Assets",
+             [("[NCA] (a) Property, plant and equipment", fixed),
+              ("[CA] (ii) Trade receivables", debtors)],
+             fixed + debtors)], year=year)
+
+
+def _check(col, name):
+    return next(c for c in col["checks"] if c["name"] == name)
+
+
+def test_run_checks_attaches_checks_and_trust(monkeypatch):
+    col = _spread(monkeypatch, {"s.pdf": _doc("s.pdf", 2025, [_pl(), _bs()])})[0]
+    assert {"checks", "trust"} <= set(col)
+    assert col["trust"]["sales_other_income"]["level"] == "proven"
+    assert col["trust"]["purchases"]["level"] == "doubtful"
+    assert col["trust"]["equity_capital"]["level"] == "proven"
+
+
+def test_derived_rows_take_the_lowest_input_level(monkeypatch):
+    col = _spread(monkeypatch, {"s.pdf": _doc("s.pdf", 2025, [_pl(), _bs()])})[0]
+    assert col["trust"]["gross_receipts"]["level"] == "proven"
+    assert col["trust"]["gross_expenses"]["level"] == "doubtful"
+    assert col["trust"]["profit_before_tax"]["level"] == "doubtful"
+
+
+def test_section_totals_check_names_the_gap(monkeypatch):
+    col = _spread(monkeypatch, {"s.pdf": _doc("s.pdf", 2025, [_pl(), _bs()])})[0]
+    r = _check(col, "Section totals")
+    assert r["status"] == "fail" and r["gap"] == 62
+    assert "purchases" in r["implicates"] and "sales_other_income" not in r["implicates"]
+
+
+def test_clean_statements_pass_every_check_they_can_run(monkeypatch):
+    good = _pl(expense_total=sum(a for _l, a in EXPENSES))
+    col = _spread(monkeypatch, {"s.pdf": _doc("s.pdf", 2025, [good, _bs()])})[0]
+    assert {c["status"] for c in col["checks"]} <= {"pass", "skip"}
+    assert not [k for k, t in col["trust"].items() if t["level"] == "doubtful"]
+
+
+def test_sheet_balances_fails_without_blaming_proven_rows():
+    col = {"values": {"total_liabilities": 5000000, "total_assets": 4000000,
+                      "equity_capital": 5000000, "fixed_assets": 4000000},
+           "sources": {"equity_capital": [{"trust": "proven"}],
+                       "fixed_assets": [{"trust": "proven"}]}}
+    trust = CK.base_trust(col)
+    r = CK.sheet_balances(col, [col], 0, trust)
+    assert r.status == "fail" and r.gap == 1000000 and r.implicates == []
+
+
+def test_sheet_balances_blames_open_rows():
+    col = {"values": {"total_liabilities": 5000000, "total_assets": 4000000,
+                      "equity_capital": 5000000, "fixed_assets": 4000000},
+           "sources": {"equity_capital": [{"trust": "consistent"}],
+                       "fixed_assets": [{"trust": "proven"}]}}
+    trust = CK.base_trust(col)
+    r = CK.sheet_balances(col, [col], 0, trust)
+    assert r.implicates == ["equity_capital"]
+
+
+def test_checks_skip_without_their_inputs():
+    col = {"values": {}, "sources": {}, "blocks_used": []}
+    trust = CK.base_trust(col)
+    assert CK.section_totals(col, [col], 0, trust).status == "skip"
+    assert CK.sheet_balances(col, [col], 0, trust).status == "skip"

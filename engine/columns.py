@@ -1094,4 +1094,8 @@ def spread_many(sources, extract_fn, api_key: str = None,
     cols.sort(key=lambda c: (c["year"] is None, c["year"] or 0))
     cols[0]["warnings"] = notes + cols[0]["warnings"]
     _recover_from_comparative(cols)
+    # Imported here, not at the top: checks.py reuses this module's
+    # cross-checks, and a top-level import would be circular.
+    from . import checks
+    checks.run_checks(cols)
     return cols
