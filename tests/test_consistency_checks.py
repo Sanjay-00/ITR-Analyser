@@ -205,3 +205,39 @@ def test_checks_skip_without_their_inputs():
     trust = CK.base_trust(col)
     assert CK.section_totals(col, [col], 0, trust).status == "skip"
     assert CK.sheet_balances(col, [col], 0, trust).status == "skip"
+
+
+
+def _pl_col(pbt=4859400, ignored=(), book=None, trust="consistent"):
+    col = {"values": {"sales_other_income": 142647963, "transport_admin": 137788563,
+                      "profit_before_tax": pbt},
+           "sources": {"sales_other_income": [{"trust": trust}],
+                       "transport_admin": [{"trust": trust}]},
+           "ignored": list(ignored), "book_profit": book, "book_profit_page": 3}
+    return col, CK.base_trust(col)
+
+
+def test_profit_vs_statement_passes_skips_and_fails():
+    col, t = _pl_col(ignored=[("Profit before tax", 4859400)])
+    assert CK.profit_vs_statement(col, [col], 0, t).status == "pass"
+    col, t = _pl_col(ignored=[])
+    assert CK.profit_vs_statement(col, [col], 0, t).status == "skip"
+    col, t = _pl_col(pbt=4000000, ignored=[("Profit before tax", 4859400)])
+    r = CK.profit_vs_statement(col, [col], 0, t)
+    assert r.status == "fail" and r.gap == 859400
+    assert set(r.implicates) == {"sales_other_income", "transport_admin"}
+
+
+def test_profit_vs_computation_passes_skips_and_fails():
+    col, t = _pl_col(book=4859400)
+    assert CK.profit_vs_computation(col, [col], 0, t).status == "pass"
+    col, t = _pl_col(book=None)
+    assert CK.profit_vs_computation(col, [col], 0, t).status == "skip"
+    col, t = _pl_col(book=6000000)
+    r = CK.profit_vs_computation(col, [col], 0, t)
+    assert r.status == "fail" and r.gap == 1140600 and "page 4" in r.detail
+
+
+def test_profit_checks_never_blame_proven_rows():
+    col, t = _pl_col(pbt=4000000, ignored=[("Profit before tax", 4859400)], trust="proven")
+    assert CK.profit_vs_statement(col, [col], 0, t).implicates == []

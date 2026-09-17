@@ -158,7 +158,42 @@ def sheet_balances(col, cols, i, trust) -> CheckResult:
                        f"total {heavier} exceed the other side by {gap:,.0f} after mapping")
 
 
-CHECKS = [section_totals, sheet_balances]
+def profit_vs_statement(col, cols, i, trust) -> CheckResult:
+    """3. Our derived profit against the profit line the statement prints."""
+    from .columns import _profit_crosscheck
+    name = "Profit vs statement"
+    v, ignored = col.get("values") or {}, col.get("ignored") or []
+    stated = taxonomy.stated_result(ignored)
+    pbt = v.get("profit_before_tax")
+    if stated is None or pbt is None:
+        return CheckResult(name, "skip", detail="the statement prints no profit line")
+    messages = _profit_crosscheck(v, ignored)
+    if not messages:
+        return CheckResult(name, "pass")
+    return CheckResult(name, "fail", abs(abs(stated) - abs(pbt)),
+                       _open_rows(col, trust, PL_ITEMS), messages[0])
+
+
+def profit_vs_computation(col, cols, i, trust) -> CheckResult:
+    """4. Our derived profit against the one the ITR's computation of income
+    restates - an independent source, typed separately."""
+    from .columns import _BOOK_PROFIT_TOLERANCE
+    name = "Profit vs ITR computation"
+    v = col.get("values") or {}
+    book, pbt = col.get("book_profit"), v.get("profit_before_tax")
+    if book is None or pbt is None:
+        return CheckResult(name, "skip", detail="no computation of income read")
+    gap = abs(book - pbt)
+    if gap <= _BOOK_PROFIT_TOLERANCE:
+        return CheckResult(name, "pass")
+    page = col.get("book_profit_page")
+    where = f" (page {page + 1})" if page is not None else ""
+    return CheckResult(name, "fail", gap, _open_rows(col, trust, PL_ITEMS),
+                       f"profit before tax {pbt:,.0f} but the computation of "
+                       f"income{where} restates {book:,.0f}")
+
+
+CHECKS = [section_totals, sheet_balances, profit_vs_statement, profit_vs_computation]
 
 
 def run_checks(cols: list) -> None:
