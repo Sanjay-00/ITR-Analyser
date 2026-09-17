@@ -197,6 +197,9 @@ def _as_text(df, digits=2, na=UNREAD):
 
 from engine.mapping.template_config import HIGHLIGHT as _HIGHLIGHT   # noqa: E402
 from engine import cache as CACHE                                    # noqa: E402
+from engine.checks import BS_ITEMS, PL_ITEMS                        # noqa: E402
+
+CHECK_INPUTS = set(PL_ITEMS + BS_ITEMS)
 
 # The rows the Excel paints yellow, plus the bottom line - tinted on screen too.
 _KEY_ROWS = {T.LABELS.get(k, k) for k in _HIGHLIGHT | {"profit_after_tax"}}
@@ -383,7 +386,12 @@ if uploads and _signature(uploads, use_vision) != st.session_state.get("signatur
 entity = borrower_name(columns)
 verified = sum(1 for c in columns for b in c["blocks_used"] if b["status"] == F.VERIFIED)
 used = sum(len(c["blocks_used"]) for c in columns)
-issues = sum(len(c["warnings"]) for c in columns)
+# Input rows a consistency check disputes (engine/checks.py) are checks to
+# review too. Only INPUT rows count: a doubtful row makes its totals doubtful
+# as well, and counting those would count one doubt several times.
+doubtful = sum(1 for c in columns for key, t in (c.get("trust") or {}).items()
+               if key in CHECK_INPUTS and t.get("level") == "doubtful")
+issues = sum(len(c["warnings"]) for c in columns) + doubtful
 flags = A.flags(columns)
 red = sum(1 for f in flags if f["severity"] == A.RED)
 
@@ -494,7 +502,8 @@ with tab_analysis:
 with tab_checks:
     for col in columns:
         bad = any(b["status"] == F.FAILED for b in col["blocks"]) or not col["blocks_used"]
-        attention = bad or col["warnings"] or col.get("unmapped")
+        failing = [chk for chk in (col.get("checks") or []) if chk["status"] == "fail"]
+        attention = bad or col["warnings"] or col.get("unmapped") or failing
         mark = ":material/error:" if attention else ":material/check_circle:"
         with st.expander(f"{_col_name(col)} · {col.get('source_name', '')}",
                          icon=mark, expanded=bool(attention)):
@@ -504,6 +513,17 @@ with tab_checks:
                        f"{len(col['blocks_used'])} statement(s) used"
                        + (f" · Vision re-read page(s) {', '.join(str(p + 1) for p in vp)}"
                           if vp else ""))
+
+            # Consistency checks that failed - passing and skipped ones stay quiet.
+            if failing:
+                st.markdown("**Consistency checks that failed**")
+                st.dataframe(pd.DataFrame([{
+                    "Check": chk["name"],
+                    "Gap (lakhs)": round(chk["gap"] / LAKH, 2),
+                    "Rows it could be": (", ".join(T.LABELS.get(k, k) for k in chk["implicates"])
+                                         or "none unproven - see Audit Trail"),
+                    "Detail": chk["detail"]} for chk in failing]),
+                    width="stretch", hide_index=True)
 
             rows = [{"Status": blk["status"], "Statement": blk["kind"],
                      "Page": blk["page"] + 1,

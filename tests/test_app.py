@@ -87,3 +87,36 @@ def test_an_address_never_names_the_workbook():
                      "Maharashtra, India, 400614")
     col["blocks_used"] = []
     assert borrower_name([col]) == "Borrower"
+
+
+
+def test_checks_tab_shows_failing_consistency_checks(monkeypatch):
+    """Consistency checks (engine/checks.py): a failing one is listed in its
+    year's Checks section with the gap and the rows it could be; passing and
+    skipped checks stay quiet."""
+    col = _column(2024, BUCKETS)
+    col["checks"] = [
+        {"name": "Sheet balances", "status": "fail", "gap": 883000,
+         "implicates": ["equity_capital"], "detail": "total liabilities exceed the other side"},
+        {"name": "Profit vs statement", "status": "pass", "gap": 0,
+         "implicates": [], "detail": ""}]
+    col["trust"] = {"equity_capital": {"level": "doubtful", "reasons": [], "evidence": []}}
+    at = _run([col], monkeypatch=monkeypatch)
+    assert not at.exception
+    shown = [str(d.value) for d in at.dataframe]
+    assert any("Sheet balances" in s for s in shown)
+    assert not any("Profit vs statement" in s for s in shown)
+
+
+
+def test_checks_count_disputed_input_rows_once(monkeypatch):
+    """A doubtful input row makes its totals doubtful too - but that is one
+    doubt, not three. Only input rows are counted (user instruction,
+    2026-09-17: repeated/derived rows are never double-counted)."""
+    col = _column(2024, BUCKETS)
+    col["warnings"] = []
+    col["checks"] = []
+    col["trust"] = {k: {"level": "doubtful", "reasons": [], "evidence": []}
+                    for k in ("equity_capital", "total_liabilities", "total_assets", "networth")}
+    at = _run([col], monkeypatch=monkeypatch)
+    assert "Checks (1)" in [t.label for t in at.tabs]
