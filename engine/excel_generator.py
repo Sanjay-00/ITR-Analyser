@@ -3,7 +3,7 @@ excel_generator.py  -  the ITR Validation spreading sheet, in the combined
 master format (see template_config's docstring).
 
 Sheet 1, "ITR Validation", is the analyst's own layout and nothing else:
-Profit & Loss, Balance Sheet, Ratios, DSCR Calculation and Financial Snap,
+Profit & Loss, Balance Sheet, Ratios, Financial Snap and year-on-year growth,
 one column per financial year, amounts in lakhs. Only the figures read from
 the accounts are written as values; every total, profit line, ratio and
 Snap figure is a LIVE Excel formula (template_config.TOTAL_FORMULAS / RATIOS
@@ -97,9 +97,13 @@ def borrower_name(columns: list) -> str:
     offer, and letting it supply one titled a whole workbook after a fragment
     of ITR form boilerplate.
     """
+    # Screened like every other use of a harvested name (columns._belongs_to):
+    # a line already rejected as a business name - an address, a sentence off
+    # a notes page - must not title the workbook or its filename either.
+    from .columns import _belongs_to
     for cols in (
-        [c for c in columns if c.get("blocks_used") and c.get("entity")],
-        [c for c in columns if c.get("entity")],
+        [c for c in columns if c.get("blocks_used") and _belongs_to(c.get("entity", ""))],
+        [c for c in columns if _belongs_to(c.get("entity", ""))],
     ):
         if cols:
             return cols[0]["entity"]
@@ -171,7 +175,41 @@ def _write_input(cell, col: dict, key: str) -> None:
         return
     if key == "preference_dividend":
         v = -abs(v)   # the sheet ADDS it: {profit_after_tax}+{preference_dividend}
+        cell.value = v / LAKH
+        return
     cell.value = v / LAKH
+    lines = (col.get("sources") or {}).get(key) or []
+    if not lines or abs(sum(s["amount"] for s in lines) - v) > 1:
+        return
+    # Written as the sum of the lines it came from ("=1.2+0.1+0.05"), so the
+    # formula bar shows what was added; the note names each line.
+    if len(lines) > 1:
+        terms = "+".join(f"{s['amount'] / LAKH:.5f}".rstrip("0").rstrip(".")
+                         for s in lines)
+        cell.value = "=" + terms.replace("+-", "-")
+    cell.comment = _source_note(lines)
+
+
+_NOTE_MAX_LINES = 25
+
+
+def _source_note(lines: list) -> Comment:
+    """'Added from:' then one line per source item, with page and file."""
+    rows = []
+    for s in lines[:_NOTE_MAX_LINES]:
+        where = f"p{s['page']}" if s.get("page") else ""
+        if s.get("file"):
+            where = f"{where}, {s['file']}" if where else s["file"]
+        rows.append(f"{s['label'][:48]}: {s['amount'] / LAKH:,.2f}"
+                    + (f"  ({where})" if where else ""))
+    if len(lines) > _NOTE_MAX_LINES:
+        rows.append(f"... and {len(lines) - _NOTE_MAX_LINES} more "
+                    "(see Audit Trail)")
+    total = sum(s["amount"] for s in lines) / LAKH
+    text = "Added from:\n" + "\n".join(rows) + f"\n= {total:,.2f} lakhs"
+    note = Comment(text, "ITR Extractor")
+    note.width, note.height = 420, min(40 + 16 * len(rows), 600)
+    return note
 
 
 def _build_sheet(wb, columns: list) -> None:
@@ -238,56 +276,6 @@ def _build_sheet(wb, columns: list) -> None:
         ratio_rows[name] = r
         r += 1
 
-    # DSCR Calculation - linked to the sheet; the analyst keys the EMIs.
-    r += 1
-    _period_header(ws, r, "DSCR Calculation", columns, merge_title=False)
-    ws.cell(row=r + 1, column=1, value="Particular").font = _f(bold=True)
-    r += 2
-    first = r
-    for label, key in (("Net Profit", "profit_after_tax"), ("Depreciation", "depreciation"),
-                       ("Interest (Including CC/OD interest)", "interest_finance")):
-        _label(ws, r, label)
-        for i in range(len(columns)):
-            c = ws.cell(row=r, column=2 + i, value=f"={refs_for(i)[key]}")
-            c.number_format, c.alignment, c.border = AMT_FMT, _a(h="center"), _b()
-        r += 1
-    total_a = r
-    _label(ws, r, "Total (A)", bold=True)
-    for i in range(len(columns)):
-        L = get_column_letter(2 + i)
-        c = ws.cell(row=r, column=2 + i, value=f"=SUM({L}{first}:{L}{r - 1})")
-        c.number_format, c.alignment, c.border, c.font = AMT_FMT, _a(h="center"), _b(), _f(bold=True)
-    r += 1
-    emi, proposed = r, r + 1
-    for label in ("Existing Monthly EMI", "Proposed Loan EMI"):
-        _label(ws, r, label)
-        for i in range(len(columns)):
-            c = ws.cell(row=r, column=2 + i)
-            c.number_format, c.alignment, c.border = AMT_FMT, _a(h="center"), _b()
-            c.fill = _fill(WARN_BG)   # the analyst's own input
-        r += 1
-    oblig = r
-    _label(ws, r, "Yearly Obligation (B)")
-    for i, col in enumerate(columns):
-        L = get_column_letter(2 + i)
-        m = C.DSCR_PROPOSED_MULTIPLIER[_status(col)]
-        c = ws.cell(row=r, column=2 + i, value=f"=SUM({L}{emi}*12+{L}{proposed}*{m})")
-        c.number_format, c.alignment, c.border = AMT_FMT, _a(h="center"), _b()
-    r += 1
-    total_b = r
-    _label(ws, r, "Total (B)", bold=True)
-    for i in range(len(columns)):
-        L = get_column_letter(2 + i)
-        c = ws.cell(row=r, column=2 + i, value=f"={L}{oblig}")
-        c.number_format, c.alignment, c.border, c.font = AMT_FMT, _a(h="center"), _b(), _f(bold=True)
-    r += 1
-    _label(ws, r, "DSCR (A/B)", bold=True)
-    for i in range(len(columns)):
-        L = get_column_letter(2 + i)
-        c = ws.cell(row=r, column=2 + i, value=f"=IFERROR({L}{total_a}/{L}{total_b},0)")
-        c.number_format, c.alignment, c.border, c.font = "0.00", _a(h="center"), _b(), _f(bold=True)
-    r += 1
-
     # Financial Snap - linked to the rows above.
     r += 2
     _period_header(ws, r, "=A2", columns, merge_title=True)
@@ -307,6 +295,28 @@ def _build_sheet(wb, columns: list) -> None:
             L = get_column_letter(2 + i)
             c = ws.cell(row=r, column=2 + i, value=f"={L}{ratio_rows[source]}")
             c.number_format, c.alignment, c.border = ratio_fmt[source], _a(h="center"), _b()
+        r += 1
+
+    # Year-on-year growth, closing the sheet. Formulas, not values: correct a
+    # figure above and its growth follows.
+    r += 2
+    _label(ws, r, "Year-on-year growth", bold=True)
+    for i, col in enumerate(columns):
+        c = ws.cell(row=r, column=2 + i, value=_col_header(col))
+        c.font, c.alignment, c.border = _f(bold=True), _a(h="center"), _b()
+    r += 1
+    for label, key in C.GROWTH:
+        _label(ws, r, label)
+        for i in range(len(columns)):
+            c = ws.cell(row=r, column=2 + i)
+            if i == 0:
+                c.value, c.font = "-", _f(color="808080")      # no prior year
+            else:
+                cur, prev = get_column_letter(2 + i), get_column_letter(1 + i)
+                src = rowmap[key]
+                c.value = f"=({cur}{src}-{prev}{src})/ABS({prev}{src})"
+                c.number_format = PCT_FMT
+            c.alignment, c.border = _a(h="center"), _b()
         r += 1
 
 
@@ -505,12 +515,54 @@ def _build_audit_sheet(wb, columns: list) -> None:
                     ).font = _f(size=9, color="808080")
             row += 1
 
+        row = _source_table(ws, row, col)
+
         for w in col.get("warnings", []):
             ws.cell(row=row, column=1, value="note").font = _f(bold=True, color="9C6500")
             ws.merge_cells(f"B{row}:E{row}")
             ws.cell(row=row, column=2, value=w).font = _f(size=9)
             row += 1
         row += 1
+
+
+_ROW_LABEL = {**T.LABELS, **{key: label for _kind, key, label in ROWS if key and label}}
+
+
+def _source_table(ws, row: int, col: dict) -> int:
+    """
+    Every sheet figure, broken down into the statement lines added to make it:
+    Sheet row | Source line | Amount (lakhs) | Page | File. The full list
+    behind each cell's own note, in sheet order.
+    """
+    sources = col.get("sources") or {}
+    if not sources:
+        return row
+    heads = ("Sheet row", "Source line (as printed)", "Lakhs", "Page", "File")
+    for j, head in enumerate(heads, 1):
+        hc = ws.cell(row=row, column=j, value=head)
+        hc.font, hc.fill, hc.border = _f(bold=True), _fill(SECTION_BG), _b()
+    row += 1
+    order = [k for _kind, k, _l in ROWS if k in sources]
+    order += [k for k in sources if k not in order]
+    for key in order:
+        lines = sources[key]
+        for n, s in enumerate(lines):
+            ws.cell(row=row, column=1,
+                    value=_ROW_LABEL.get(key, key) if n == 0 else "").font = _f(bold=n == 0)
+            ws.cell(row=row, column=2, value=s["label"][:80]).font = _f(size=9)
+            a = ws.cell(row=row, column=3, value=s["amount"] / LAKH)
+            a.number_format = AMT_FMT
+            ws.cell(row=row, column=4, value=s.get("page")).alignment = _a(h="center")
+            ws.cell(row=row, column=5, value=s.get("file") or "").font = _f(size=9)
+            for cc in range(1, 6):
+                ws.cell(row=row, column=cc).border = _b()
+            row += 1
+        if len(lines) > 1:
+            ws.cell(row=row, column=2, value="= total").font = _f(size=9, italic=True)
+            t = ws.cell(row=row, column=3, value=sum(s["amount"] for s in lines) / LAKH)
+            t.number_format, t.font = AMT_FMT, _f(bold=True)
+            row += 1
+    return row
 
 
 def get_filename(entity: str, columns: list = None) -> str:

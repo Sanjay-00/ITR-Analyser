@@ -250,9 +250,23 @@ def _classify(title_line: str, sides: dict) -> str:
 _MAX_TITLE_LEN = 80
 
 # "as on 31st March, 2024" / "for the year ended 31/03/2024"
+# Three date shapes, the year always group 3:
+#   "31st March, 2024" / "31 MAR 2024"   day then month
+#   "March 31, 2025"                     month then day - Schedule III / Ind AS
+#   "31.03.2024" / "31/03/2024"          numeric
+# The month-first form used to be missed outright: "Balance Sheet as at March
+# 31, 2025" matched nothing, the statement got no year of its own and fell
+# back to its FILE's year - on a real case (Borrower H) filing FY2025's
+# Balance Sheet and P&L under 2024 once files were pooled by year.
 _PERIOD_RE = re.compile(
-    r"(?:as\s*on|for\s*the\s*year\s*end\w*|as\s*at)\D{0,20}"
-    r"(?:(\d{1,2})\s*(?:st|nd|rd|th)?\s*[-/\s]?\s*([A-Za-z]{3,9})[,\s]*)?(\d{4})",
+    r"(?:as\s*on|for\s*the\s*(?:year|period)\s*end\w*(?:\s*on)?|as\s*at)\D{0,20}?"
+    # Any run of spaces and commas around one optional -/. separator: "31st,
+    # March , 2025" (A CUSTOMER AY2025-26) had a comma the old single
+    # separator refused, and the P&L lost its year - and with it its whole
+    # comparative year (see find_blocks).
+    r"(?:(\d{1,2})\s*(?:st|nd|rd|th)?[\s,]*[-/.]?[\s,]*([A-Za-z]{3,9})\.?[,\s]*"
+    r"|[A-Za-z]{3,9}\.?\s+\d{1,2}(?:st|nd|rd|th)?\s*,?\s*"
+    r"|\d{1,2}\s*[./-]\s*\d{1,2}\s*[./-]\s*)?(\d{4})",
     re.I,
 )
 
@@ -348,7 +362,9 @@ _DERIVED_ROW_RE = re.compile(
 _SKIP_RE = re.compile(
     r"^\s*(?:(?:proprietors?|partners?|directors?|to|by)\s*$|"
     r"(?:particulars?|paticulars?|liabilities|assets|sch\.?|schedule|amount|"
-    r"total|as\s+per\s+our\s+report|place|date|udin|for[,\s]|"
+    # "total outstanding dues ..." is Schedule III's spelling of TRADE
+    # PAYABLES - a line item, not a total row (see _ANCHOR_RE).
+    r"total(?!\s+outstanding\s+dues)|as\s+per\s+our\s+report|place|date|udin|for[,\s]|"
     r"chartered\s+account|signature)\b)",
     re.I,
 )
@@ -591,7 +607,17 @@ def _match_title(line: str) -> bool:
 # An address line sits between the entity name and the heading in most layouts.
 _ADDRESS_RE = re.compile(
     r"\b(road|nagar|marg|street|chowk|complex|shop\s*no|near|dist|"
-    r"pin|opp\.?|building|plot|floor)\b", re.I)
+    r"pin|opp\.?|building|plot|floor|house|sector|wing|tower|lane|"
+    r"colony|society|premises|midc|industrial\s+area|taluka|flat)\b", re.I)
+
+# Keywords alone are not enough - a real filing's address used none of the
+# ones above ("6-A, H & G House, Sector 11, C B D Belapur, Navi Mumbai,
+# Maharashtra, India, 400614") and was taken for the business name, which
+# then titled the whole workbook. An address also has a SHAPE a business
+# name does not: a six-digit PIN code, or a string of comma-separated
+# locality parts. Either is enough on its own.
+_PIN_RE = re.compile(r"(?<!\d)\d{6}(?!\d)")
+_ADDRESS_PARTS = 3
 
 # An address keyword alone is not enough: "road", "nagar" and "complex" are
 # common words in a genuine Indian BUSINESS name too ("Borrower A Road
@@ -602,6 +628,8 @@ _ADDRESS_DETAIL_RE = re.compile(r"\d|,")
 
 
 def _looks_like_address(cand: str) -> bool:
+    if _PIN_RE.search(cand) or cand.count(",") >= _ADDRESS_PARTS:
+        return True
     return bool(_ADDRESS_RE.search(cand) and _ADDRESS_DETAIL_RE.search(cand))
 
 
@@ -650,6 +678,28 @@ def _find_entity(lines: list, idx: int) -> str:
     return fallback
 
 
+# A numeric date written with a two-digit year - "FOR THE YEAR ENDED
+# 31.03.26" (Borrower D' provisional set), "as at 31/03/25".
+# _PERIOD_RE wants four digits, so such a statement had NO period at all:
+# it could not be pooled with the other file's Balance Sheet for the same
+# year and became its own undated column. Widened only inside a complete
+# numeric date, never for a bare two-digit number, which is how a note
+# reference or a stray figure would otherwise read as a year.
+_SHORT_YEAR_RE = re.compile(r"(?<!\d)(\d{1,2}\s*[./-]\s*\d{1,2}\s*[./-]\s*)(\d{2})(?!\d)")
+
+
+# The same with a month NAME - "1-Apr-25 to 31-Mar-26", Tally's own period
+# line. Still only inside a complete date: day, month name, then the year.
+_SHORT_YEAR_NAMED_RE = re.compile(
+    r"(?<!\d)(\d{1,2}\s*[-/.\s]\s*[A-Za-z]{3,9}\.?\s*[-/.,\s]\s*)(\d{2})(?!\d)")
+
+
+def _widen_short_year(line: str) -> str:
+    def widen(m):
+        return f"{m.group(1)}{'19' if int(m.group(2)) >= 70 else '20'}{m.group(2)}"
+    return _SHORT_YEAR_NAMED_RE.sub(widen, _SHORT_YEAR_RE.sub(widen, line))
+
+
 def _find_period(lines: list, idx: int):
     """
     (ending_year, raw_text) for the statement's period.
@@ -660,10 +710,134 @@ def _find_period(lines: list, idx: int):
     misses every instance of the latter.
     """
     for j in range(idx, min(len(lines), idx + 1 + _PERIOD_LOOKAHEAD)):
-        m = _PERIOD_RE.search(lines[j])
+        m = _PERIOD_RE.search(_widen_short_year(lines[j]))
         if m:
             return int(m.group(3)), re.sub(r"\s+", " ", lines[j]).strip()
     return None, ""
+
+
+# A statement too long for one page. Tally bridges the break with its own
+# running subtotal - "Carried Over" at the foot of one page, "Brought
+# Forward" at the head of the next - and prints the real Total only at the
+# end. Read a page at a time (the old assumption: each statement is printed
+# whole), the first half can never balance because its other side continues
+# overleaf, and the second half reads as a separate statement whose two
+# brought-forward figures fit no row at all. Confirmed on a real filing (YES
+# A CUSTOMER FY2026: Balance Sheet across two pages, Rs 21.05 crore of
+# "Brought Forward" excluded and the statement failed by Rs 26.76 crore).
+#
+# The bridge rows themselves are NOT items - they restate what is already
+# above - so both are dropped as the pages are joined.
+_CARRIED_RE = re.compile(r"^\s*carried\s*(?:over|forward|fwd)\b", re.I)
+_BROUGHT_RE = re.compile(r"^\s*brought\s*(?:forward|over|fwd)\b|^\s*b/?f\b", re.I)
+# Tally's other spelling of the same break: no running subtotal at all, just
+# "continued ..." at the foot and the statement's heading repeated overleaf.
+# The P&L of a real filing (A CUSTOMER) breaks this way, and its whole
+# Indirect Expenses block - Rs 1.24 crore, including Rs 86.98 lakh of
+# employee cost - sat on the far side of the break, with the statement's only
+# real Total. Profit read Rs 292.50 lakh against a printed Rs 176.75 lakh.
+_CONTINUED_RE = re.compile(r"^\s*\(?\s*continued\s*[.\u2026]*\s*\)?\s*$", re.I)
+
+
+def _row_matching(rows: list, rx) -> int:
+    for i, (_y, cells) in enumerate(rows):
+        if rx.match(" ".join(t for _a, _b, t in cells).strip()):
+            return i
+    return None
+
+
+def _join_continuations(page_rows: list) -> list:
+    """
+    Join a statement that runs onto the next page, at its own Carried Over /
+    Brought Forward bridge. The continuation page is emptied rather than
+    removed, so every other page keeps its number.
+
+    Deliberately requires BOTH halves of the bridge: two unrelated statements
+    printed back to back have neither, and stay separate.
+    """
+    pages = [list(rows or []) for rows in (page_rows or [])]
+    for i in range(len(pages) - 1):
+        cur = pages[i]
+        if not cur:
+            continue
+        carried = _row_matching(cur, _CARRIED_RE)
+        continued = _row_matching(cur, _CONTINUED_RE)
+        if carried is None and continued is None:
+            continue
+        for j in range(i + 1, len(pages)):      # the next page holding anything
+            if pages[j]:
+                break
+        else:
+            continue
+        nxt = pages[j]
+        brought = _row_matching(nxt, _BROUGHT_RE)
+        if brought is not None:
+            start = brought + 1
+        elif continued is not None and _repeats_heading(nxt):
+            # No bridge figure: the continuation simply reprints the heading.
+            # Everything above its first figure is that repeated header.
+            start = next((k for k, (_y, cells) in enumerate(nxt)
+                          if _row_has_amount(cells)), None)
+            if start is None:
+                continue
+        else:
+            continue
+        cut = carried if carried is not None else continued
+        # Keep the joined rows in reading order: the continuation's own y
+        # coordinates start again at the top of its page.
+        drop = max((y for y, _c in cur), default=0) + 1000
+        pages[i] = cur[:cut] + [(y + drop, cells) for y, cells in nxt[start:]]
+        pages[j] = []
+    return pages
+
+
+def _row_has_amount(cells: list) -> bool:
+    return any(_cell_amount(t.strip()) is not None for _a, _b, t in cells)
+
+
+_HEADING_SCAN = 4
+
+
+def _repeats_heading(rows: list) -> bool:
+    """Does this page open by reprinting a statement's own heading? That is
+    what marks it a continuation rather than the next statement."""
+    return any(_match_title(" ".join(t for _a, _b, t in cells))
+               for _y, cells in rows[:_HEADING_SCAN])
+
+
+# A column header naming its period's year: "2025", "As at 31st March, 2025",
+# "31.03.2024". Read only ABOVE the statement's first figure - a year printed
+# further down is a line item's, not a column's.
+_HEADER_YEAR_RE = re.compile(r"(?<![\d,.])((?:19|20)\d{2})(?![\d,])")
+# "1-Apr-2023 to 31-Mar-2024" is ONE period, and it ends in 2024. Tally heads
+# every statement this way; read year by year, the range's START year was
+# taken and Borrower L's FY2024 statements were dated 2023 (69 rows off a
+# sheet that had matched in full). Within such a cell only the end counts.
+_PERIOD_RANGE_RE = re.compile(r"\d.*?\s(?:to|till|upto|[-\u2013\u2014])\s.*\d", re.I)
+
+
+def _header_years(rows: list) -> list:
+    """
+    The years a statement's own column headers name, left to right - this
+    period first, then its comparatives. The heading is the usual source of a
+    statement's year, but a heading can print no date, or one the period
+    pattern cannot parse; the columns still say which year each holds.
+    """
+    found = []
+    for _y, cells in rows:
+        if _row_has_amount(cells):
+            break
+        for x0, _x1, txt in sorted(cells, key=lambda c: c[0]):
+            wide = _widen_short_year(txt)
+            ys = [int(m.group(1)) for m in _HEADER_YEAR_RE.finditer(wide)]
+            if ys and _PERIOD_RANGE_RE.search(wide):
+                ys = ys[-1:]            # a range: the period it ENDS in
+            found.extend((x0, y) for y in ys)
+    years = []
+    for _x, y in sorted(found):
+        if y not in years:
+            years.append(y)
+    return years
 
 
 def find_blocks(page_rows: list, only_pages=None) -> list:
@@ -684,7 +858,7 @@ def find_blocks(page_rows: list, only_pages=None) -> list:
     """
     wanted = None if only_pages is None else set(only_pages)
     blocks = []
-    for page_no, rows in enumerate(page_rows or []):
+    for page_no, rows in enumerate(_join_continuations(page_rows)):
         if not rows or (wanted is not None and page_no not in wanted):
             continue
         lines = [" ".join(t for _a, _b, t in cells) for _y, cells in rows]
@@ -695,6 +869,11 @@ def find_blocks(page_rows: list, only_pages=None) -> list:
             end   = titles[n + 1] if n + 1 < len(titles) else len(lines)
             body  = rows[idx + 1:end]
             year, period = _find_period(lines, idx)
+            header_years = _header_years(rows[idx + 1:end])
+            if year is None and header_years:
+                # No readable date in the heading: the columns name the years.
+                year = header_years[0]
+                period = period or f"column header {year}"
             foot = _footer_at(body)
             if foot is not None:
                 body = body[:foot]
@@ -731,6 +910,7 @@ def find_blocks(page_rows: list, only_pages=None) -> list:
             # ever see, then scaled the same way every other figure on this
             # page is (it was harvested in the statement's own printed units).
             comparative = sides.pop("comparative", None)
+            comp_sections = sides.pop("comparative_sections", None)
 
             # Everything downstream works in whole rupees.
             scale = _unit_scale(lines, idx)
@@ -739,6 +919,12 @@ def find_blocks(page_rows: list, only_pages=None) -> list:
                 total = int(round(total * scale))
             if comparative:
                 comparative = {k: int(round(v * scale)) for k, v in comparative.items()}
+
+            if comp_sections:
+                for sec in comp_sections:
+                    sec["items"] = [(l, int(round(a * scale))) for l, a in sec["items"]]
+                    if sec["total"] is not None:
+                        sec["total"] = int(round(sec["total"] * scale))
 
             blocks.append({
                 "unit_scale":    scale,
@@ -753,7 +939,224 @@ def find_blocks(page_rows: list, only_pages=None) -> list:
                 "comparative":   ({"year": year - 1, "totals": comparative}
                                   if comparative and year else None),
             })
+
+            # The comparative column as a statement of the PRIOR year. It
+            # carries the same labels, so it maps like any other statement,
+            # and it is checked against its own printed totals rather than
+            # trusted for being adjacent. Marked so the caller can prefer a
+            # real statement for that year (columns.spread_many).
+            if comp_sections and year and _has_items({"sections": comp_sections}):
+                prior_year = (header_years[1]
+                              if len(header_years) > 1 and header_years[1] < year
+                              else year - 1)
+                prior = dict(blocks[-1])
+                prior.update({
+                    "year":             prior_year,
+                    "period":           f"comparative column of: {period}"[:120],
+                    "sides":            {"sections": comp_sections},
+                    "printed_total":    None,
+                    "comparative":      None,
+                    "from_comparative": True,
+                })
+                blocks.append(prior)
     return blocks
+
+
+# ─────────────────────────────────────────────────────────────────
+# SCHEDULES  -  the breakdown behind a statement's group lines
+# ─────────────────────────────────────────────────────────────────
+# A proprietorship's P&L face often prints only "Direct Expenses (Sch 8)
+# 4,69,84,240" and "Indirect Expenses (Sch 9) 22,69,814"; the salary, the
+# loan interest and the transport charges the spread needs live on the
+# schedule pages behind them. Read only from the face, a real filing (Borrower E
+# Enterprises FY2023) reported Employee Costs and Interest as zero - no
+# interest cover, and 2.88 crore of wages filed as transport.
+#
+# A schedule is recognised by its own numbered heading ("Sch 08 Direct
+# Expenses", "Note 15 : Employee benefits expense", "Schedule E - Cash") and
+# is only trusted when its lines add up to the Total it prints itself - the
+# same arithmetic proof the statements get.
+_SCHEDULE_HEAD_RE = re.compile(
+    r"^\s*(?i:sch(?:edule)?|note|annexure)\s*\.?\s*(?i:no\.?\s*)?[-:]?\s*"
+    # The number: 1-2 digits, "o7" (OCR's zero), or ONE capital letter.
+    # Case-sensitive on purpose: "Notes forming part..." must not read its
+    # "s" as schedule "S".
+    # The name may open with an accented OCR letter ("Schedule H : Éxpenses").
+    r"(\d{1,2}|[oO]\d|[A-Z])(?![A-Za-z0-9])\s*[.:\-)'\"]*\s*([^\W\d_].*)$")
+
+
+def _schedule_heading(line: str):
+    flat = re.sub(r"\s+", " ", line).strip()
+    m = _SCHEDULE_HEAD_RE.match(flat)
+    if not m or _MONEY_RE.search(flat):
+        return None
+    name = m.group(2).strip(" .:-|")
+    if not re.search(r"[A-Za-z]{3}", name):
+        return None
+    return m.group(1).upper().replace("O", "0"), name
+
+
+def _schedule_row(cells: list):
+    """(label, [amounts]) for one schedule row. A label cell may carry its own
+    amount welded on ("Transport Charges Paid 1,73,42,490")."""
+    labels, amounts = [], []
+    for _a, _b, txt in _split_amount_runs(cells):
+        t = txt.strip()
+        if _has_label_text(t):
+            m = _AMOUNT_RE.search(t)
+            if m and _has_label_text(t[:m.start()]):
+                amounts.append(_clean_amount(m.group(1)))
+                t = t[:m.start()]
+            labels.append(t.strip())
+        else:
+            amt = _cell_amount(t)
+            if amt is not None:
+                amounts.append(amt)
+    return " ".join(labels).strip(" .:-|"), amounts
+
+
+def _schedule(number, name, caption, page, items, total, scale) -> dict:
+    items = [(l, int(round(a * scale))) for l, a in items]
+    total = None if total is None else int(round(total * scale))
+    verified = (total is not None and abs(sum(a for _l, a in items) - total)
+                <= max(TOLERANCE, len(items)) * scale)
+    return {"number": number, "name": name, "caption": caption, "page": page,
+            "items": items, "total": total, "verified": verified, "scale": scale}
+
+
+def find_schedules(page_rows: list) -> list:
+    """
+    Every numbered schedule / note in the document, one entry per GROUP:
+        {"number", "name", "caption", "page", "items": [(label, rupees)],
+         "total", "verified"}
+    `verified` means the lines sum to the group's own printed Total. Only
+    the FIRST amount on a line is the line's own - a second one is the
+    running group total printed beside the group's last line ("Salary and
+    Wages 2,87,60,157 | 4,69,84,240"), or last year's comparative.
+
+    One heading can hold several groups, each under its own caption and
+    closed by its own Total - Borrower I's "Schedule H : Expenses"
+    is "Direct expenses ... Total" then "Indirect expenses ... Total". So a
+    Total closes the current group, not the schedule, and `caption` is the
+    label-only line that opened the group.
+    """
+    out = []
+    for page_no, rows in enumerate(page_rows or []):
+        if not rows:
+            continue
+        lines = [" ".join(t for _a, _b, t in cells) for _y, cells in rows]
+        heads = [(i, h) for i, ln in enumerate(lines) if (h := _schedule_heading(ln))]
+        for n, (idx, (number, name)) in enumerate(heads):
+            end = heads[n + 1][0] if n + 1 < len(heads) else len(rows)
+            scale = _unit_scale(lines, idx)
+            caption, items = "", []
+            for _y, cells in rows[idx + 1:end]:
+                label, amounts = _schedule_row(cells)
+                if not amounts:
+                    if label and not items:
+                        caption = label     # the group's own sub-heading
+                    continue
+                if not label:
+                    continue                # a running subtotal
+                if _TOTAL_RE.match(label):
+                    if items:
+                        out.append(_schedule(number, name, caption, page_no,
+                                             items, amounts[0], scale))
+                    caption, items = "", []
+                    continue
+                items.append((label, amounts[0]))
+            if items:
+                out.append(_schedule(number, name, caption, page_no, items, None, scale))
+    return out
+
+
+# Only a GROUP line is replaced by its schedule - one that names a class of
+# expense rather than an expense. "Other expenses" is deliberately excluded:
+# analysts keep it as one row, and its schedule's lines (bank charges,
+# audit fees) would otherwise scatter into buckets the reference never uses.
+_EXPANDABLE_RE = re.compile(
+    r"\b(?:direct|indirect|operating|operational|operation|administrative|"
+    r"admin|establishment|general|selling|manufacturing)\b.*\bexp", re.I)
+_NAME_STOP = {"expenses", "expense", "xpenses", "account", "charges", "other",
+              "particulars", "amount", "total"}
+
+
+def _name_words(label: str) -> set:
+    label = re.sub(r"^\[[A-Z]+\]\s*", "", label)
+    return {w.lower() for w in re.findall(r"[A-Za-z]{4,}", label)} - _NAME_STOP
+
+
+def expand_with_schedules(block: dict, schedules: list) -> list:
+    """
+    Replace a P&L group line with its schedule's own lines, in place, when the
+    schedule proves itself: verified against its printed Total, that Total
+    equal to the group line's amount, and a name word in common ("Indirect
+    Expenses" / "Sch 09 Indirect Expenses"). The block's totals are
+    unchanged by construction, so its balance proof still holds. The line's
+    section tag ("[EXP]") is carried onto every replacement line.
+
+    Returns the names of the schedules used, for the audit trail.
+    """
+    if block.get("kind") != PROFIT_LOSS or not schedules:
+        return []
+    used, taken = [], set()
+    face = [(it[0], it[1]) for it in all_items(block["sides"])]
+
+    def _lines_for(label, amount, s):
+        """The schedule's lines standing for this face line, or None."""
+        tol = max(TOLERANCE, s["scale"], block.get("unit_scale", 1))
+        kids = list(s["items"])
+        extra = s["total"] - amount
+        if abs(extra) <= tol:
+            return kids
+        # The schedule may also list a line the face prints on its own:
+        # Borrower I's "Indirect expenses" schedule includes Depreciation,
+        # which its P&L shows separately - schedule 110.01 cr = face 94.43 cr
+        # + Depreciation 15.59 cr. Dropped only when those lines account for
+        # the whole difference, so the proof still holds.
+        dup = [k for k in kids
+               if any(fl != label and abs(k[1] - fa) <= tol
+                      and _name_words(k[0]) & _name_words(fl) for fl, fa in face)]
+        if dup and abs(sum(k[1] for k in dup) - extra) <= tol:
+            return [k for k in kids if k not in dup]
+        return None
+
+    def _expand(items):
+        out = []
+        for it in items:
+            label, amount = it[0], it[1]
+            pick = None
+            if _EXPANDABLE_RE.search(label):
+                want = _name_words(label)
+                for n, s in enumerate(schedules):
+                    if (n in taken or not s["verified"]
+                            or not want & _name_words(f"{s['name']} {s['caption']}")):
+                        continue
+                    kids = _lines_for(label, amount, s)
+                    if kids is not None:
+                        pick = (n, kids)
+                        break
+            if pick is None:
+                out.append(it)
+                continue
+            n, kids = pick
+            taken.add(n)
+            tag = re.match(r"^\[[A-Z]+\]\s*", label)
+            prefix = tag.group(0) if tag else ""
+            out.extend((prefix + l, a) for l, a in kids)
+            s = schedules[n]
+            used.append(f"{s['caption'] or s['name']} (p{s['page'] + 1})")
+        return out
+
+    sides = block["sides"]
+    if sides.get("sections"):
+        for s in sides["sections"]:
+            s["items"] = _expand(s["items"])
+    else:
+        for side in ("left", "right"):
+            if side in sides:
+                sides[side] = _expand(sides[side])
+    return used
 
 
 # A cell holding an amount immediately followed by text is two columns whose gap
@@ -1169,6 +1572,21 @@ _SECTIONS = [
 ]
 
 
+# Tally names its retained-profit group "Profit & Loss A/c" and prints it on
+# WHICHEVER SIDE the balance falls: a credit balance down the liabilities
+# side (A CUSTOMER FY2026 - Rs 1.76 crore of retained profit, which
+# without a tag inherited the Current Liabilities context above it and was
+# spread as a current liability), a debit balance among the ASSETS (Borrower A
+# Road Carrier FY2024 - Rs 310.29 lakh of accumulated loss, which the
+# analyst's own sheet carries as an asset).
+#
+# So the name alone cannot say what it is; the side it sits on does. It is
+# read as equity only on a side that has already shown equity or liability
+# groups - never on the assets side.
+_PL_GROUP_RE = re.compile(r"^\s*profit\s*(?:&|and)\s*loss(?:\s*a/?c(?:count)?)?\s*$", re.I)
+_LIABILITY_SIDE_TOKENS = {"EQ", "LIAB", "SL", "UL", "CL", "NCL"}
+
+
 def _section_token(label: str):
     for token, rx in _SECTIONS:
         if rx.search(label):
@@ -1176,7 +1594,45 @@ def _section_token(label: str):
     return None
 
 
-def _current_period_amount(cells: list, cur, prior: list):
+# A bare 1-2 digit cell: either a Note No. reference or a genuinely small
+# amount. Nothing in the text itself tells them apart (see _AMOUNT_RE's
+# exactly-3-digit fallback) - only WHERE it sits does.
+_SMALL_BARE_RE = re.compile(r"^\(?\s*-?\s*(\d{1,2})\s*\)?$")
+
+
+def _period_right_edge(rows: list, cur, prior: list):
+    """
+    Where this period's figures END on the page - the median right edge of
+    the amounts already readable without ambiguity.
+
+    Statement columns are RIGHT-aligned, so every figure of one period shares
+    a right edge, while the Note No. column keeps its own far to the left.
+    That is what separates a real Rs 63 from "Note 63"; the digit count
+    cannot (Borrower D FY2025, docs/SHORTCOMINGS.md Case 28).
+    """
+    if not cur:
+        return None
+    edges = []
+    for _y, cells in rows:
+        best, best_d = None, None
+        for x0, x1, txt in _split_amount_runs(cells):
+            t = txt.strip()
+            if re.search(r"[A-Za-z]{3}", t) or not _AMOUNT_RE.search(t):
+                continue
+            if any(x0 < p[1] and x1 > p[0] for p in prior):
+                continue
+            d = abs((x0 + x1) / 2 - (cur[0] + cur[1]) / 2)
+            if best_d is None or d < best_d:
+                best, best_d = x1, d
+        if best is not None:
+            edges.append(best)
+    if not edges:
+        return None
+    edges.sort()
+    return edges[len(edges) // 2]
+
+
+def _current_period_amount(cells: list, cur, prior: list, cur_right=None):
     """
     The current period's figure on this row.
 
@@ -1188,17 +1644,30 @@ def _current_period_amount(cells: list, cur, prior: list):
     comparative period are excluded outright - those are last year's numbers.
     """
     best, best_d = None, None
+    tol = None if not cur else max(4.0, 0.15 * (cur[1] - cur[0]))
     for x0, x1, txt in cells:
         txt = txt.strip()
         m = _AMOUNT_RE.search(txt)
-        if not m or re.search(r"[A-Za-z]{3}", txt):
+        if re.search(r"[A-Za-z]{3}", txt):
             continue
+        small = None
+        if not m:
+            # A genuinely small amount ("63") is invisible to _AMOUNT_RE,
+            # which only takes a bare integer of exactly 3 digits so that a
+            # Note No. is never harvested as money. Admitted here only when
+            # it ends where this period's other figures end - the note
+            # column's own right edge is nowhere near.
+            sm = _SMALL_BARE_RE.match(txt)
+            if not (sm and cur_right is not None and abs(x1 - cur_right) <= tol):
+                continue
+            small = float(sm.group(1))
         if any(x0 < p[1] and x1 > p[0] for p in prior):
             continue
-        val = _clean_amount(m.group(1))
+        val = small if small is not None else _clean_amount(m.group(1))
         if val is None:
             continue
-        signed = -val if _is_negative(txt, txt[:m.start()]) else val
+        signed = (-val if _is_negative(txt, txt[:m.start()] if m else "")
+                  else val)
         if cur is None:
             # No header to go on - skip a bare note reference, take the first
             # real figure.
@@ -1209,6 +1678,38 @@ def _current_period_amount(cells: list, cur, prior: list):
         if best_d is None or d < best_d:
             best, best_d = signed, d
     return best
+
+
+def _drop_restated_parent(items: list, total):
+    """
+    A Schedule III line printed WITH its own breakdown underneath:
+
+        (b) Trade Payables                                  278.85
+            (A) total outstanding dues of micro enterprises    -
+            (B) total outstanding dues of other creditors  278.85
+
+    Both the line and its breakdown carry figures, so harvesting both counts
+    the payables twice - on a real filing (Borrower H FY2025) Current
+    Liabilities summed to 1,129.51 lakh against a printed 850.65, over by
+    exactly 278.85. Dropped only when the arithmetic proves it: the section
+    is over its printed total by one line's amount, and the lines right after
+    that one add up to it. (Figures are in the statement's printed units
+    here, before rescaling.)
+    """
+    if total is None or len(items) < 2:
+        return items
+    excess = sum(a for _l, a in items) - total
+    if abs(excess) <= 0.011 * len(items):
+        return items
+    for i, (_l, a) in enumerate(items):
+        if abs(a - excess) > 0.011 * len(items):
+            continue
+        run = 0
+        for j in range(i + 1, len(items)):
+            run += items[j][1]
+            if abs(run - a) <= 0.011 * (j - i):
+                return items[:i] + items[i + 1:]
+    return items
 
 
 def _harvest_vertical(rows: list) -> dict:
@@ -1264,10 +1765,22 @@ def _harvest_vertical(rows: list) -> dict:
     # across filings while the grand totals held. See has_both_statement_kinds's
     # neighbour in relevance.py for the same "totals are trustworthy,
     # sub-buckets are not" principle applied to a different problem.
+    # Where this period's figures end, so a small bare figure in that column
+    # can be told from a Note No. (see _period_right_edge).
+    cur_right = _period_right_edge(rows, cur, prior_item)
+
     prior_col = cols[1] if len(cols) > 1 else None
     _comparative_others = ([c for c in cols if c is not prior_col]
                            if prior_col else [])
     comparative = {}
+    # The prior column read line by line, not just at its anchors - a
+    # provisional set can be the only record of last year (Borrower D
+    # FY2026). Emitted by find_blocks as a statement of its own, so it is
+    # checked against its own printed totals; a real statement for that year
+    # always wins over it (columns.spread_many).
+    prior_right = (_period_right_edge(rows, prior_col, _comparative_others)
+                   if prior_col else None)
+    comp_sections, comp_current = [], []
 
     sections, current, anchors = [], [], []
     section_token = None
@@ -1300,7 +1813,7 @@ def _harvest_vertical(rows: list) -> dict:
 
         is_anchor = bool(label and _ANCHOR_RE.match(label))
         amount = _current_period_amount(
-            cells, cur, prior_anchor if is_anchor else prior_item)
+            cells, cur, prior_anchor if is_anchor else prior_item, cur_right)
 
         if is_anchor and amount is not None:
             # A bare "Total" (its "(A)"/"(B)" marker is too short to survive
@@ -1311,9 +1824,18 @@ def _harvest_vertical(rows: list) -> dict:
                 name = "Total " + re.sub(
                     r"^\s*(?:[A-Z]{1,4}\s*[\].):]\s*|[IVX]{1,4}\s+)", "",
                     section_heading).strip(" :-")
-            sections.append({"name": name, "items": current, "total": amount})
+            sections.append({"name": name, "items": _drop_restated_parent(current, amount),
+                             "total": amount})
             anchors.append(amount)
             if prior_col:
+                prior_total = _current_period_amount(
+                    cells, prior_col, _comparative_others, prior_right)
+                if comp_current or prior_total is not None:
+                    comp_sections.append({
+                        "name": name,
+                        "items": _drop_restated_parent(comp_current, prior_total),
+                        "total": prior_total})
+                comp_current = []
                 for key, pat in _COMPARATIVE_ANCHOR_PATTERNS.items():
                     if pat.search(label):
                         prior_amt = _current_period_amount(
@@ -1329,6 +1851,25 @@ def _harvest_vertical(rows: list) -> dict:
         # A heading carries no figure of its own; it sets the context for the
         # rows beneath it.
         if label and amount is None:
+            # ... but a line that is NIL this year and real last year
+            # ("(b) Deferred tax | - | (13,69,133)") is a heading only for
+            # THIS period. Without this the comparative year lost every such
+            # line - sample_d's FY2025 deferred tax credit among them, which
+            # left that year's loss overstated by Rs 13.69 lakh.
+            if prior_col:
+                prior_only = _current_period_amount(
+                    cells, prior_col, _comparative_others, prior_right)
+                if prior_only is not None:
+                    comp_label = (f"[{section_token}] {label}" if section_token
+                                  else label)
+                    if _ANCHOR_RE.match(label):
+                        comp_sections.append({
+                            "name": label,
+                            "items": _drop_restated_parent(comp_current, prior_only),
+                            "total": prior_only})
+                        comp_current = []
+                    else:
+                        comp_current.append((comp_label, prior_only))
             token = _section_token(label)
             if token:
                 section_token = token
@@ -1349,7 +1890,8 @@ def _harvest_vertical(rows: list) -> dict:
         # the heading just above it turns that into a per-subsection check,
         # the same proof already applied to every LABELLED anchor here.
         if not label and amount is not None and section_heading and current:
-            sections.append({"name": section_heading, "items": current,
+            sections.append({"name": section_heading,
+                             "items": _drop_restated_parent(current, amount),
                              "total": amount})
             anchors.append(amount)
             current = []
@@ -1371,12 +1913,23 @@ def _harvest_vertical(rows: list) -> dict:
             if section_token:
                 label = f"[{section_token}] {label}"
             current.append((label, amount))
+            if prior_col:
+                prior_amount = _current_period_amount(
+                    cells, prior_col, _comparative_others, prior_right)
+                if prior_amount is not None:
+                    comp_current.append((label, prior_amount))
 
     if current:
         sections.append({"name": section_heading or "", "items": current,
                          "total": None})
+    if comp_current:
+        comp_sections.append({"name": section_heading or "", "items": comp_current,
+                              "total": None})
 
-    return {"sections": sections, "comparative": comparative}
+    out = {"sections": sections, "comparative": comparative}
+    if comp_sections:
+        out["comparative_sections"] = comp_sections
+    return out
 
 
 def _harvest_at(rows: list, mid: float, printed_total, title_cells=None,
@@ -1397,6 +1950,7 @@ def _harvest_at(rows: list, mid: float, printed_total, title_cells=None,
     # own) names the pending figure; any figure-bearing line cancels it.
     pending = {"left": None, "right": None}
     section = {"left": "", "right": ""}   # last group heading, per side
+    seen = {"left": set(), "right": set()}   # every token this side has shown
 
     # Seed section context from the heading row itself (see _harvest's
     # docstring) - split by the SAME divider used for the body, so "CAPITAL
@@ -1409,7 +1963,9 @@ def _harvest_at(rows: list, mid: float, printed_total, title_cells=None,
                 continue
             token = _section_token(txt)
             if token:
-                section["left" if (x0 + x1) / 2 < mid else "right"] = token
+                where = "left" if (x0 + x1) / 2 < mid else "right"
+                section[where] = token
+                seen[where].add(token)
 
     for _y, cells in rows:
         # A bare amount belongs to the label on ITS OWN ROW, and takes that
@@ -1494,8 +2050,12 @@ def _harvest_at(rows: list, mid: float, printed_total, title_cells=None,
                 # A label-only cell that names a group sets the context for the
                 # entries beneath it on that side of the account.
                 token = _section_token(heading)
+                if (token is None and _PL_GROUP_RE.match(heading.strip())
+                        and seen[side] & _LIABILITY_SIDE_TOKENS):
+                    token = "EQ"        # retained profit, on the liabilities side
                 if token:
                     section[side] = token
+                    seen[side].add(token)
                 # ...and names a figure printed just above it, if one is
                 # waiting (see `pending`) - but only when this caption has no
                 # figure of its own on the same row.
@@ -1735,9 +2295,22 @@ _PERIOD_COL_RE = re.compile(
 # A row is a section anchor when its label is a Total. Vertical statements print
 # sub-totals unlabelled and section totals as "TOTAL" - often numbered, as
 # "III Total Revenue (I+II)" or "4. Total Expenses".
+# "(?=[A-Z])" as well as \b: OCR can glue "Total" to the next word
+# ("TotalAssets", Borrower H FY2024) - left unrecognised, the grand total was
+# harvested as a Rs 24.19 crore line item instead of anchoring the check.
+# "total outstanding dues of micro enterprises ..." / "... of creditors
+# other than micro enterprises and small enterprises" is how Schedule III
+# spells out TRADE PAYABLES: two line items that happen to OPEN with the
+# word "total", not a section total. Read as anchors they closed the
+# Current liabilities group - the payables figure became a section total
+# with no items (so it vanished from the sheet) and the lines below it
+# lost their [CL] tag, which spread a current tax LIABILITY as the P&L's
+# tax expense. On a real filing (Borrower D FY2025) Total of
+# Liabilities came up Rs 499 lakh short of Total of Assets and the year's
+# loss was overstated by Rs 66.75 lakh.
 _ANCHOR_RE = re.compile(
     r"^\s*(?:[IVX]{1,4}[\s.)]+|\(?\d{1,2}\)?[\s.)]+)?"
-    r"(?:total|gross\s+total)\b", re.I)
+    r"(?:total|gross\s+total)(?!\s+outstanding\s+dues)(?:\b|(?=[A-Z]))", re.I)
 
 # Grand-total anchors worth recovering from a comparative column - deliberately
 # the same small set check_block's own BS/P&L grand-total checks already key
@@ -1990,6 +2563,26 @@ _UNVERIFIABLE = ("no printed total", "no section totals", "nothing to check",
                  "single-column statement with no printed total")
 
 
+def _tol(block: dict, n_items: int) -> float:
+    """
+    How far a sum may miss its printed total and still reconcile, in rupees.
+
+    A statement printed in rupees is checked to TOLERANCE. One printed in
+    thousands or lakhs cannot be: each line was ROUNDED to the printed unit
+    before the total was, so the lines legitimately miss it by up to half a
+    unit each. On a real filing (Borrower H, "Rs in lakhs") a correct
+    Current Liabilities section summed to 850.66 lakh against a printed
+    850.65 - Rs 1,000 - and failed; Borrower P's '000 statement missed by Rs 190.
+    Half the last printed unit per line: thousands print whole units (Rs 500),
+    lakhs and crores print two decimals (Rs 500 / Rs 50,000).
+    """
+    scale = block.get("unit_scale") or 1
+    if scale <= 1:
+        return TOLERANCE
+    half_unit = scale / 2 if scale <= 1000 else scale / 200
+    return TOLERANCE + half_unit * max(n_items, 1)
+
+
 def status_of(check: dict) -> str:
     if check["balanced"]:
         return VERIFIED
@@ -2046,13 +2639,14 @@ def check_block(block: dict) -> dict:
                              "line was read, so the revenue side is missing")
             return out
         out["shortfall"] = printed - left
-        out["balanced"]  = abs(out["shortfall"]) <= TOLERANCE
+        out["balanced"]  = abs(out["shortfall"]) <= _tol(block, len(block["sides"]["left"]))
         if not out["balanced"]:
             out["reason"] = (f"items sum to {left:,} against a printed total of "
                              f"{printed:,} (short by {out['shortfall']:,})")
         return out
 
-    if abs(left - right) > TOLERANCE:
+    n_lr = len(block["sides"]["left"]) + len(block["sides"]["right"])
+    if abs(left - right) > _tol(block, n_lr):
         out["shortfall"] = right - left
         side = "left" if left < right else "right"
         out["reason"] = (f"{side} side sums to {min(left, right):,} against "
@@ -2060,7 +2654,7 @@ def check_block(block: dict) -> dict:
                          f"(short by {abs(out['shortfall']):,})")
         return out
 
-    if printed is not None and abs(left - printed) > TOLERANCE:
+    if printed is not None and abs(left - printed) > _tol(block, n_lr):
         out["shortfall"] = printed - left
         out["reason"] = (f"both sides sum to {left:,} but the statement prints "
                          f"a total of {printed:,} (short by {out['shortfall']:,})")
@@ -2117,7 +2711,7 @@ def _check_sections(block: dict) -> dict:
     for s in checked:
         got  = sum(a for _l, a in s["items"])
         diff = s["total"] - got
-        if abs(diff) > TOLERANCE:
+        if abs(diff) > _tol(block, len(s["items"]) + 1):
             failures.append(f"{s['name'] or 'section'}: items sum to {got:,} "
                             f"against a printed {s['total']:,} "
                             f"(short by {diff:,})")
@@ -2138,7 +2732,7 @@ def _check_sections(block: dict) -> dict:
         eqliab = _named_total(sections, r"total\s+equity\s+(?:and|&)\s+liabilit"
                                         r"|total\s+liabilit\w*\s+(?:and|&)\s+equity")
         if assets is not None and eqliab is not None:
-            if abs(assets - eqliab) > TOLERANCE:
+            if abs(assets - eqliab) > _tol(block, 2):
                 out["reason"] = (f"Assets total {assets:,} but Equity & "
                                  f"Liabilities total {eqliab:,}")
                 return out
@@ -2152,7 +2746,7 @@ def _check_sections(block: dict) -> dict:
             # as unverified rather than passed.
             totals = sorted((s["total"] for s in sections if s["total"] is not None),
                             reverse=True)
-            paired = any(abs(a - b) <= TOLERANCE
+            paired = any(abs(a - b) <= _tol(block, 2)
                          for a, b in zip(totals, totals[1:]))
             if not paired:
                 out["reason"] = ("no grand total found to check the balance "

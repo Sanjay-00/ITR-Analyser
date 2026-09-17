@@ -52,6 +52,13 @@ REL_TOL = 0.005  # 0.5%, for larger figures where ABS_TOL is too tight
 GLOBAL_SKIP_LABELS = {
     "existingmonthlyemi", "proposedloanemi", "yearlyobligationb",
     "totalb", "dscrab", "totala",
+    # The rest of that block, dropped from our sheet 2026-09-16 by decision
+    # (its EMI rows are keyed by hand from a loan schedule, not read from any
+    # ITR). The analysts' sheets still carry the rows; ours no longer has
+    # them, and "we don't print this row" is not a reading failure. Every
+    # figure they hold is compared anyway in the P&L above - Net Profit is
+    # Profit after tax, Interest is Interest and Finance Expenses.
+    "particular", "netprofit", "interestincludingccodinterest",
     # The DSCR ratio row itself (main RATIOS block and Financial Snap) is a
     # live formula over those same hand-keyed EMI cells - our sheet writes it
     # as a formula with no cached value, so it can never be compared here.
@@ -218,7 +225,16 @@ def _year_grid(ws, max_scan_row=40, max_col=15, evaluate=False):
     return grid
 
 
-def _close(a, b) -> bool:
+# Analysts enter tax with opposite signs ("=PBT+tax" with tax negative in some
+# sheets, "=PBT-tax" with tax positive in others); the master format uses
+# the latter. The effect is checked where it matters - Profit after tax - so
+# the two tax rows themselves are compared by magnitude.
+_SIGN_CONVENTION_ROWS = {"provisionfortax", "provisionfordeferredtax"}
+
+
+def _close(a, b, label="") -> bool:
+    if label in _SIGN_CONVENTION_ROWS:
+        a, b = abs(a), abs(b)
     return abs(a - b) <= max(ABS_TOL, abs(b) * REL_TOL)
 
 
@@ -249,6 +265,18 @@ def test_matches_reference_workbook(path, ref_path):
             mine[into] = {y: (v or 0) + (mine[sub].get(y) or 0)
                           for y, v in mine[into].items()}
 
+    # Electricity has no row of ours any more (2026-09-16, by decision): the
+    # power bill is spread with Transport operation and admin charges. The
+    # analysts' sheets still carry the row, so fold THEIRS the same way -
+    # otherwise the same money would be counted as missing from our column
+    # and as a shortfall in transport.
+    if "electricity" in theirs and "electricity" not in mine:
+        into = "transportoperationandadmincharges"
+        if into in theirs:
+            theirs[into] = {y: (v or 0) + (theirs["electricity"].get(y) or 0)
+                            for y, v in theirs[into].items()}
+        del theirs["electricity"]
+
     mismatches = []
     for label, ref_vals in theirs.items():
         if label in skip_labels or label in GLOBAL_SKIP_LABELS:
@@ -265,7 +293,7 @@ def test_matches_reference_workbook(path, ref_path):
             mine_v = None if mine_vals is None else mine_vals.get(year)
             if mine_v is None:
                 mismatches.append(f"{label} {year}: reference={ref_v:.3f}, ours=Check ITR/missing")
-            elif not _close(mine_v, ref_v):
+            elif not _close(mine_v, ref_v, label):
                 mismatches.append(f"{label} {year}: reference={ref_v:.3f}, ours={mine_v:.3f}")
 
     assert not mismatches, (

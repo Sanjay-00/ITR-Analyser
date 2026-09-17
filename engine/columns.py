@@ -23,6 +23,7 @@ each verified, and every label that could not be mapped. Nothing enters the
 sheet without a trail back to the statement it came from.
 """
 
+import os
 import re
 
 from .extract import financials as F
@@ -45,12 +46,19 @@ def _fy_end_year(blocks: list, identity: dict):
     derived from the Assessment Year: AY 2024-25 assesses FY 2023-24, so the
     year the accounts end in is the AY's FIRST year, not its second.
     """
-    years = [b["year"] for b in blocks if b.get("year")]
-    if years:
-        return max(set(years), key=years.count)
     ay = identity.get("ay") or ""
     m = re.match(r"(\d{4})", ay)
-    return int(m.group(1)) if m else None
+    ay_year = int(m.group(1)) if m else None
+    years = [b["year"] for b in blocks if b.get("year")]
+    if years:
+        # A tie is broken by the return's own Assessment Year, then the
+        # earliest - not arbitrarily. "ITR 2022-2023.pdf" (AY 2023-24) held
+        # one FY2023 and one FY2024 Balance Sheet and was dated 2024 by
+        # set-iteration order.
+        top = max(years.count(y) for y in set(years))
+        tied = sorted(y for y in set(years) if years.count(y) == top)
+        return ay_year if ay_year in tied else tied[0]
+    return ay_year
 
 
 # A block whose figures are mostly figures we already have is a restatement,
@@ -144,15 +152,31 @@ def _dedupe(blocks: list, main_entity: str = "") -> list:
     blocks kept ahead of it. Verified and larger blocks are ranked first, so
     what survives is the statement and what goes is the restatement.
     """
+    # Same key, DIFFERENT figures: two complementary statements, not two
+    # readings of one. A petrol pump prints its Trading ("PUMP ACCOUNT") and
+    # its Profit & Loss on one page, both profit_loss and neither naming an
+    # entity, so both land on the same key - and keeping only the "best" threw
+    # the trading account away with the year's whole turnover (Borrower B
+    # FY2025: Rs 21.71 lakh of income against Rs 1,659.38 printed). Only a
+    # block whose figures OVERLAP the incumbent is a rival reading of it; the
+    # rest are kept and judged by the restatement pass below.
     best = {}
     for b in blocks:
         key = (b.get("entity", "").strip().lower(), b["kind"], b.get("year"))
-        if key not in best or _rank(b) > _rank(best[key]):
-            best[key] = b
+        rivals = best.setdefault(key, [])
+        mine = {a for _l, a in F.all_items(b["sides"]) if a}
+        for i, other in enumerate(rivals):
+            theirs = {a for _l, a in F.all_items(other["sides"]) if a}
+            if mine and theirs and len(mine & theirs) > _DUPLICATE_SHARE * len(mine):
+                if _rank(b) > _rank(other):
+                    rivals[i] = b
+                break
+        else:
+            rivals.append(b)
 
     # A verified block has proved itself and is taken as-is. An unverified one
     # is admitted only if it is plainly part of the borrower's own accounts.
-    candidates = [b for b in best.values()
+    candidates = [b for rivals in best.values() for b in rivals
                   if b["status"] == F.VERIFIED
                   or _belongs_to(b.get("entity", ""), main_entity)]
 
@@ -401,10 +425,44 @@ def _escalate(blocks: list, source, api_key: str, vision_fn,
     return out, sent
 
 
-def spread_document(source, extract_fn, api_key: str = None,
-                    invoke_fn=None, on_progress=None, vision_fn=None) -> dict:
+# How far (in pages) a dated statement can lend its period to an undated one.
+_YEAR_NEIGHBOUR_PAGES = 2
+
+
+def _infer_missing_years(blocks: list) -> None:
     """
-    One ITR PDF → one year column.
+    A statement that prints no period of its own takes the period of the
+    nearest DATED statement in the same file - preferring the same business,
+    within _YEAR_NEIGHBOUR_PAGES - before anything falls back to the file's
+    ITR year.
+
+    A proprietor's Balance Sheet and P&L are printed as a pair, and often
+    only one of them carries the date. The ITR it sits in is weaker evidence:
+    on a real case (Borrower O) each bundle held the OTHER year's
+    accounts - "ITR 23-24.pdf" (AY 2024-25) carried the Balance Sheet "as on
+    31.03.2023" and an undated P&L beside it - and the P&L, filed under its
+    ITR's year, landed a whole year off the analyst's sheet. Marked
+    `year_inferred`; mutates `blocks` in place.
+    """
+    dated = [b for b in blocks if b.get("year") and b["kind"] in SPREAD_KINDS]
+    for b in blocks:
+        if b.get("year") or b["kind"] not in SPREAD_KINDS or not dated:
+            continue
+        ent = _norm_entity(b.get("entity", ""))
+        near = min(dated, key=lambda o: (_norm_entity(o.get("entity", "")) != ent,
+                                         abs(o["page"] - b["page"])))
+        if abs(near["page"] - b["page"]) <= _YEAR_NEIGHBOUR_PAGES:
+            b["year"] = near["year"]
+            b["year_inferred"] = True
+
+
+def _read_document(source, extract_fn, api_key: str = None,
+                   on_progress=None, vision_fn=None) -> dict:
+    """
+    Read ONE uploaded PDF: locate, harvest and check its statements (with the
+    Vision re-read where enabled), plus its identity and page facts. Nothing
+    is mapped or totalled here - `_assemble` does that per FINANCIAL YEAR,
+    from the statements of every uploaded file that belong to that year.
 
     `extract_fn(source, on_progress)` returns (text, scanned, page_texts,
     page_rows, page_confidence); it is injected so this module stays
@@ -475,18 +533,73 @@ def spread_document(source, extract_fn, api_key: str = None,
             statement_pages |= recovered_pages
         blocks, vision_pages = _escalate(blocks, source, api_key, vision_fn,
                                          main, statement_pages, page_confidence)
-        main = _main_entity(blocks, identity)
+
+    # A P&L face that prints only "Direct / Indirect Expenses" takes its
+    # breakdown from the schedule pages of the SAME file (see
+    # financials.find_schedules). page_rows holds every page, so schedules
+    # that relevance dropped are still seen.
+    schedules = F.find_schedules(page_rows)
+    for b in blocks:
+        if b["status"] != F.FAILED:
+            b["schedules_used"] = F.expand_with_schedules(b, schedules)
+
+    name = getattr(source, "name", source if isinstance(source, str) else "")
+    for b in blocks:
+        b["source"] = os.path.basename(str(name)) if name else ""
+    _infer_missing_years(blocks)
+    candidates = [b for b in blocks
+                  if b["kind"] in SPREAD_KINDS and b["status"] != F.FAILED]
+    return {
+        "source_name":      name,
+        "identity":         identity,
+        "scanned":          scanned,
+        "book_profit":      book_profit,
+        "book_profit_page": book_profit_page,
+        "pages_total":      len(page_texts),
+        "pages_used":       len(pages),
+        "page_summary":     relevance.summary(page_texts),
+        "blocks":           blocks,
+        "vision_pages":     vision_pages,
+        # The year this FILE is about, for statements that print no period
+        # of their own and for the computation sheet's restated profit.
+        "year":             _fy_end_year(candidates, identity),
+    }
+
+
+def _assemble(year, blocks: list, docs: list, api_key: str = None,
+              invoke_fn=None) -> dict:
+    """
+    One financial year's column, from `blocks` - every statement, from any of
+    the uploaded files in `docs`, that belongs to that year.
+
+    A borrower's case rarely arrives one-PDF-per-year: the ITR acknowledgement
+    and the financial statements are often separate files, an audit report
+    reprints the same statements, and one bundle can carry two years (on a
+    real case, "ITR 2022-2023.pdf" held the FY2023 AND the FY2024 Balance
+    Sheet). Read file by file, each PDF became its own column - duplicates,
+    a wrongly-dated column, and an empty column for a loan offer letter.
+    Pooled by each statement's OWN period instead, `_dedupe` keeps the best
+    reading of each statement (verified first) and drops the reprints.
+    """
+    identity = next((d["identity"] for d in docs if d["year"] == year),
+                    docs[0]["identity"] if docs else {})
+    main = _main_entity(blocks, identity)
     usable = _dedupe([b for b in blocks
                       if b["kind"] in SPREAD_KINDS and b["status"] != F.FAILED],
                      main_entity=main)
 
-    items = [it for b in usable for it in _spread_items(b)]
+    # Each line keeps where it came from, so every sheet figure can show the
+    # lines it adds up (see `sources` below).
+    located = [(it[0], it[1], b.get("page"), b.get("source", ""))
+               for b in usable for it in _spread_items(b)]
+    items = [(l, a) for l, a, _p, _s in located]
     learned = taxonomy.load_learned()
     buckets, unmapped, ignored = taxonomy.map_items(items, learned)
+    resolved = {}
 
     # Only the labels nothing claimed go to the model, and only their text.
     if unmapped and api_key and invoke_fn:
-        resolved = taxonomy.llm_map([l for l, _a in unmapped], api_key, invoke_fn)
+        resolved = taxonomy.llm_map([l for l, _a in unmapped], api_key, invoke_fn) or {}
         if resolved:
             still = []
             for label, amount in unmapped:
@@ -499,6 +612,22 @@ def spread_document(source, extract_fn, api_key: str = None,
 
     mapping_check = taxonomy.check_mapping(items, buckets, unmapped, ignored)
 
+    # Transparency: row key -> every source line that was added into it, as
+    # {label, amount, page, file}. The workbook writes each figure as the sum
+    # of these lines, so an analyst can see what makes up "CC/OD 1.35".
+    sources = {}
+    for label, amount, page, src in located:
+        key = taxonomy.map_label(label, learned)
+        if key is None:
+            key = resolved.get(label)
+        if not key or key is taxonomy.IGNORE:
+            continue
+        sources.setdefault(key, []).append({
+            "label": re.sub(r"^\[[A-Z]+\]\s*", "", label),
+            "amount": taxonomy._mapped_amount(label, amount),
+            "page": None if page is None else page + 1,
+            "file": src})
+
     # A statement we could not read must not render as a column of zeros. If
     # the P&L failed and the balance sheet passed, the P&L rows are UNKNOWN
     # ("Check ITR"), not nil - the difference between "this business earned
@@ -508,9 +637,24 @@ def spread_document(source, extract_fn, api_key: str = None,
                               have_pl=F.PROFIT_LOSS in have,
                               have_bs=F.BALANCE_SHEET in have)
 
-    entity = main or next((b["entity"] for b in usable if b.get("entity")), "")
+    # Screened the same way _main_entity screens its candidates: a line
+    # already rejected as a name (an address, a sentence from a note page)
+    # must not title the column just because it was the first one going.
+    entity = main or next((b["entity"] for b in usable
+                           if _belongs_to(b.get("entity", ""))), "")
 
     notes = taxonomy.assumptions(items, learned)
+    from_comp = sorted({b["kind"].replace("_", " ") for b in usable
+                        if b.get("from_comparative")})
+    if from_comp:
+        notes.insert(0, {
+            "label": "(whole statement)", "amount": None,
+            "target": ", ".join(from_comp),
+            "note": ("Read from the comparative column printed beside a later "
+                     "year's statement, not from this year's own filing. The "
+                     "column balances against its own printed totals, but a "
+                     "later auditor can reclassify figures between buckets."),
+        })
     scales = {b.get("unit_scale", 1) for b in usable}
     for scale in sorted(s for s in scales if s and s != 1):
         name = {1000: "thousands", 100000: "lakhs",
@@ -540,36 +684,57 @@ def spread_document(source, extract_fn, api_key: str = None,
                   if b["kind"] in SPREAD_KINDS and b["status"] == F.VERIFIED
                   and b.get("comparative")}
 
+    # The computation sheet restates the profit of the year its FILE is about.
+    book, book_page = next(((d["book_profit"], d["book_profit_page"]) for d in docs
+                            if d["year"] == year and d["book_profit"] is not None),
+                           (None, None))
+    summary = {}
+    for d in docs:
+        for k, v in (d.get("page_summary") or {}).items():
+            summary[k] = summary.get(k, 0) + v
+
     return {
-        "year":           _fy_end_year(usable, identity),
+        "year":           year,
         # "PROV. BALANCE SHEET", "Provisional P&L" - the sheet's column
         # heading then says "Provisional" instead of "Audited".
         "provisional":    any(re.search(r"\bprov(?:isional)?\b\.?", b.get("title") or "", re.I)
                               for b in usable),
         "entity":         entity,
         "identity":       identity,
-        "scanned":        scanned,
-        "pages_total":    len(page_texts),
-        "pages_used":     len(pages),
-        "page_summary":   relevance.summary(page_texts),
+        "scanned":        any(d["scanned"] for d in docs),
+        "pages_total":    sum(d["pages_total"] for d in docs),
+        "pages_used":     sum(d["pages_used"] for d in docs),
+        "page_summary":   summary,
         "blocks":         blocks,
         "blocks_used":    usable,
         "values":         values,
+        "sources":        sources,
         "ratios":         taxonomy.ratios(values),
-        "vision_pages":   vision_pages,
+        "vision_pages":   [p for d in docs for p in d["vision_pages"]],
         "unmapped":       unmapped,
         "ignored":        ignored,
         "assumptions":    notes,
         "mapping_check":  mapping_check,
         "comparative":    comparative,
-        "book_profit":    book_profit,
-        "source_name":    getattr(source, "name",
-                                  source if isinstance(source, str) else ""),
-        "warnings":       _warnings(blocks, usable, unmapped, mapping_check)
+        "book_profit":    book,
+        "source_name":    " + ".join(os.path.basename(str(d["source_name"]))
+                                     for d in docs),
+        "warnings":       ([f"{' and '.join(from_comp)} taken from the comparative "
+                            f"column of a later year's statement - no filing for "
+                            f"this year was uploaded"] if from_comp else [])
+                          + _warnings(blocks, usable, unmapped, mapping_check,
+                                    multi=len(docs) > 1)
                           + _profit_crosscheck(values, ignored)
-                          + _book_profit_crosscheck(values, book_profit,
-                                                    book_profit_page),
+                          + _book_profit_crosscheck(values, book, book_page),
     }
+
+
+def spread_document(source, extract_fn, api_key: str = None,
+                    invoke_fn=None, on_progress=None, vision_fn=None) -> dict:
+    """One ITR PDF → one year column, read on its own. spread_many pools
+    several files by year instead."""
+    doc = _read_document(source, extract_fn, api_key, on_progress, vision_fn)
+    return _assemble(doc["year"], doc["blocks"], [doc], api_key, invoke_fn)
 
 
 # The computation sheet restates profit to the rupee, but it can be the
@@ -659,7 +824,14 @@ def _looks_nil(blocks: list) -> bool:
     return biggest < _NIL_RETURN_MAX
 
 
-def _warnings(blocks, usable, unmapped, mapping_check) -> list:
+def _where(b: dict, multi: bool) -> str:
+    """'page 19' - or 'page 19 of Audit Report.pdf' when a year's column was
+    built from several files."""
+    src = b.get("source") if multi else ""
+    return f"page {b['page'] + 1}" + (f" of {src}" if src else "")
+
+
+def _warnings(blocks, usable, unmapped, mapping_check, multi: bool = False) -> list:
     out = []
     for b in blocks:
         # A note/disclosure table (Reserves & Surplus, Share Capital, ...)
@@ -669,12 +841,12 @@ def _warnings(blocks, usable, unmapped, mapping_check) -> list:
         # analyst about nothing. Only warn about blocks that look like a
         # real statement in the first place.
         if b["status"] == F.FAILED and _belongs_to(b.get("entity", "")):
-            out.append(f"{b['kind']} on page {b['page'] + 1} "
+            out.append(f"{b['kind']} on {_where(b, multi)} "
                        f"({b.get('entity') or 'unnamed'}) did not reconcile: "
                        f"{b['check']['reason']}")
     for b in usable:
         if b["status"] == F.UNVERIFIED:
-            out.append(f"{b['kind']} on page {b['page'] + 1} "
+            out.append(f"{b['kind']} on {_where(b, multi)} "
                        f"({b.get('entity') or 'unnamed'}) prints no total, so "
                        f"its figures could not be checked")
     if not usable:
@@ -774,28 +946,143 @@ def _recover_from_comparative(cols: list) -> None:
                         "with more caution than a directly-verified figure")
 
 
+def _empty_column(source_name: str, warnings: list) -> dict:
+    return {
+        "year": None, "entity": "", "identity": {}, "scanned": False,
+        "pages_total": 0, "pages_used": 0, "page_summary": {},
+        "blocks": [], "blocks_used": [], "values": {}, "ratios": {},
+        "unmapped": [], "ignored": [], "assumptions": [],
+        "mapping_check": {"ok": False, "diff": 0},
+        "comparative": {}, "book_profit": None, "provisional": False,
+        "vision_pages": [], "source_name": source_name, "warnings": warnings,
+    }
+
+
 def spread_many(sources, extract_fn, api_key: str = None,
                 invoke_fn=None, on_progress=None, vision_fn=None) -> list:
-    """Several bundles → year columns, oldest first."""
-    cols, total = [], len(sources)
+    """
+    All of one borrower's uploaded files → one column per financial year,
+    oldest first.
+
+    Every file is read, then every statement is placed in the year its own
+    period says ("as at 31st March 2024" - or, when it prints none, the year
+    of the file it came from) and each year is assembled from whatever files
+    hold its statements (see `_assemble`). A file with no statements at all -
+    a loan offer letter, a covering page - gets no column of its own, only a
+    note; so does a file that could not be read at all, which must not cost
+    the others their columns.
+    """
+    docs, notes, total = [], [], len(sources)
     for i, src in enumerate(sources):
         cb = (lambda p, t, _i=i: on_progress(_i, total, p, t)) if on_progress else None
+        name = getattr(src, "name", src if isinstance(src, str) else "")
         try:
-            cols.append(spread_document(src, extract_fn, api_key, invoke_fn, cb,
-                                        vision_fn=vision_fn))
+            docs.append(_read_document(src, extract_fn, api_key, cb, vision_fn))
         except Exception as e:
-            # One unreadable bundle must not cost the other two their columns.
-            cols.append({
-                "year": None, "entity": "", "identity": {}, "scanned": False,
-                "pages_total": 0, "pages_used": 0, "page_summary": {},
-                "blocks": [], "blocks_used": [], "values": {}, "ratios": {},
-                "unmapped": [], "ignored": [], "assumptions": [],
-                "mapping_check": {"ok": False, "diff": 0},
-                "comparative": {}, "book_profit": None,
-                "source_name": getattr(src, "name",
-                                       src if isinstance(src, str) else ""),
-                "warnings": [f"Could not be read: {e}"],
-            })
+            notes.append(f"Could not read {os.path.basename(str(name))}: {e}")
+
+    def _amounts(b):
+        return {a for _l, a in F.all_items(b["sides"]) if a}
+
+    # Each year's statements from files that are ABOUT that year (the
+    # statement's own period matches its file's): (business, kind) -> the
+    # figures of each such statement.
+    claimed = {}
+    for d in docs:
+        for b in d["blocks"]:
+            if (b["kind"] in SPREAD_KINDS and not b.get("from_comparative")
+                    and (b.get("year") or d["year"]) == d["year"]):
+                claimed.setdefault(d["year"], {}).setdefault(
+                    (_norm_entity(b.get("entity", "")), b["kind"]), []).append(_amounts(b))
+
+    def _year_of(b, d):
+        """
+        The year a statement goes in: its own period, with one exception.
+
+        When that period differs from its file's and the other year already
+        holds this business's same statement from a file about that year,
+        the FIGURES decide:
+          - the same figures: a REPRINT (an audit report or a later filing
+            repeating the statement) - it moves, and _dedupe drops it there.
+            Borrower H's FY2025 Balance Sheet reprinted inside "ITR 2023-2024.pdf"
+            is one; kept in 2024 instead, it was added to FY2024's own and
+            doubled that year's totals.
+          - different figures: a MISREAD date - it stays with its file. On a
+            real case (Borrower R) page 2 of the FY2025 P&L read as
+            2024; moved, FY2025 lost its depreciation and interest (PBT
+            134.81 -> 353.43 lakh) and the page sat unused beside FY2024's
+            genuine, differently-figured P&L.
+        """
+        y = b.get("year") or d["year"]
+        # A comparative column is last year's figures printed inside this
+        # year's statement: its year is not in doubt, and the reprint/misread
+        # reasoning below (which is about a page whose DATE may be wrong)
+        # would otherwise drag it into the year it was printed in and add it
+        # to that year's own figures.
+        if b.get("from_comparative"):
+            return y
+        if y == d["year"] or d["year"] is None or b["kind"] not in SPREAD_KINDS:
+            return y
+        rivals = claimed.get(y, {}).get((_norm_entity(b.get("entity", "")), b["kind"]))
+        if not rivals:
+            return y
+        mine = _amounts(b)
+        if mine and any(len(mine & r) > _DUPLICATE_SHARE * len(mine) for r in rivals):
+            return y                 # a reprint - moves, then deduped
+        return d["year"]             # a misread date - stays with its file
+
+    groups = {}          # year -> (blocks, docs)
+    for d in docs:
+        for b in d["blocks"]:
+            y = _year_of(b, d)
+            blocks, members = groups.setdefault(y, ([], []))
+            blocks.append(b)
+            if d not in members:
+                members.append(d)
+
+    # The weakest reading of a year, kept only where that year has no
+    # statement of its own of that kind: a comparative column is one column
+    # of a statement about ANOTHER year. Where the borrower's own filing for
+    # the year is in the upload, that filing decides - and the comparative
+    # must not be pooled ALONGSIDE it, which would add the two together.
+    for _y, (blocks, _members) in groups.items():
+        own = {b["kind"] for b in blocks if not b.get("from_comparative")}
+        blocks[:] = [b for b in blocks
+                     if not b.get("from_comparative") or b["kind"] not in own]
+
+    for d in docs:
+        if d["blocks"]:
+            continue
+        label = os.path.basename(str(d["source_name"]))
+        if d["year"] is not None and d["year"] not in groups:
+            # A year with no statements anywhere still gets its column - a NIL
+            # return is a finding about the borrower, not a reading failure.
+            groups[d["year"]] = ([], [d])
+        elif d["year"] in groups:
+            groups[d["year"]][1].append(d)
+        else:
+            notes.append(f"Not used: {label} - no financial statements found in it")
+
+    # Statements that printed no period, from a file with no year either, can
+    # only form an undated column - and if none of them was usable it would
+    # be a column of unread zeros headed by a file name. On a real case
+    # ("ITR 2025-26.pdf", a 2-page P&L that failed its check) that column's
+    # heading also read as "2025" and shadowed the real FY2025 column. Such a
+    # file gets a note instead.
+    undated = groups.get(None)
+    if undated and not any(b["kind"] in SPREAD_KINDS and b["status"] != F.FAILED
+                           for b in undated[0]):
+        del groups[None]
+        for d in undated[1]:
+            notes.append(f"Not used: {os.path.basename(str(d['source_name']))} - its "
+                         f"statements could not be read or dated")
+
+    cols = [_assemble(y, blocks, members, api_key, invoke_fn)
+            for y, (blocks, members) in groups.items()]
+    if not cols:
+        cols = [_empty_column(" + ".join(os.path.basename(str(getattr(s, "name", s)))
+                                         for s in sources), [])]
     cols.sort(key=lambda c: (c["year"] is None, c["year"] or 0))
+    cols[0]["warnings"] = notes + cols[0]["warnings"]
     _recover_from_comparative(cols)
     return cols

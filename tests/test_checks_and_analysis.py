@@ -9,6 +9,8 @@ a check that existed but could not see the failure it was meant to catch.
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from engine import analysis as A                                     # noqa: E402
@@ -531,6 +533,45 @@ def test_lettered_summary_pl_with_bare_totals_verifies():
     assert T.compute(buckets)["profit_before_tax"] == 3269400
 
 
+def test_statement_in_lakhs_tolerates_rounding_of_its_lines():
+    """Borrower H FY2025 (Rs in lakhs): 278.85 + 434.80 + 137.01 = 850.66 against
+    a printed 850.65 - Rs 1,000, pure rounding - must reconcile."""
+    L = 100000
+    block = {"kind": F.BALANCE_SHEET, "unit_scale": L, "sides": {
+        "left": [], "right": [], "sections": [
+            {"name": "(4) Current Liabilities", "total": round(850.65 * L),
+             "items": [("Trade Payables", round(278.85 * L)),
+                       ("Other current liabilities", round(434.80 * L)),
+                       ("Short Term Provision", round(137.01 * L))]},
+            {"name": "Total Equity & Liabilities", "total": 100 * L,
+             "items": [("x", 50 * L), ("y", 50 * L)]},
+            {"name": "Total Assets", "total": 100 * L,
+             "items": [("a", 60 * L), ("b", 40 * L)]}]}}
+    assert F.check_block(block)["balanced"], F.check_block(block)["reason"]
+    # The same Rs 1,000 in a statement printed in rupees is a real miss.
+    block["unit_scale"] = 1
+    assert not F.check_block(block)["balanced"]
+
+
+def test_line_printed_with_its_own_breakdown_is_counted_once():
+    """Borrower H FY2025: '(b) Trade Payables 278.85' then its MSME breakdown
+    '(B) ... other creditors 278.85' - both were counted."""
+    items = [("(b) Trade Payables", 278.85),
+             ("(B) total outstanding dues of creditors other than micro", 278.85),
+             ("(c) Other current liabilities", 434.80),
+             ("(d) Short Term Provision", 137.01)]
+    kept = F._drop_restated_parent(items, 850.65)
+    assert [l for l, _a in kept] == [l for l, _a in items[1:]]
+    # A section that already reconciles is left alone.
+    assert F._drop_restated_parent(items[1:], 850.65) == items[1:]
+
+
+def test_total_glued_to_the_next_word_is_still_a_total():
+    assert F._ANCHOR_RE.match("TotalAssets")
+    assert F._ANCHOR_RE.match("Total Assets")
+    assert T.map_label("[NCA] TotalAssets", {}) is T.IGNORE
+
+
 def test_garbled_embedded_ocr_layer_is_detected():
     """Borrower I AY 2023-24: a scanner app's own OCR layer, trusted as
     digital text because it was not blank."""
@@ -543,6 +584,161 @@ def test_garbled_embedded_ocr_layer_is_detected():
     assert not _looks_garbled(clean)
     # A single typo is not the layer.
     assert not _looks_garbled("Total 51,65,06,94g and 1,06,29,79,990")
+
+
+@pytest.mark.parametrize("line,year", [
+    ("Balance Sheet as at March 31, 2025", 2025),          # month first (Borrower H)
+    ("Statement of Profit and Loss for the year ended March 31, 2025", 2025),
+    ("BALANCE SHEET AS AT 31ST MARCH, 2023", 2023),        # day first
+    ("BALANCE SHEET AS ON 31.03.2024", 2024),              # numeric
+    ("Balance Sheet as at 31/03/2026", 2026),
+    ("PROFIT AND LOSS ACCOUNT FOR THE YEAR ENDED ON 31ST MARCH 2026", 2026),
+])
+def test_statement_period_in_every_date_shape(line, year):
+    assert F._find_period([line], 0)[0] == year
+
+
+def test_misspelt_deferred_tax_liability_stays_on_the_balance_sheet():
+    """Borrower H FY2023: 'Deferred Tax Liabilty (Net)' fell through to the P&L."""
+    assert T.map_label("[NCL] (b) Deferred Tax Liabilty (Net)", {}) == "deferred_tax_liability"
+    assert T.map_label("Deferred Tax Liability (Net)", {}) == "deferred_tax_liability"
+    assert T.map_label("C. Deferred Tax", {}) == "provision_deferred_tax"
+
+
+def test_mat_credit_on_the_pl_is_part_of_the_tax_charge():
+    """Borrower H FY2023: PBT 1,84,98,578 - current tax 31,08,354 - MAT credit
+    32,19,297 = the printed 1,21,70,927; the analyst spreads MAT credit as
+    deferred tax. A Balance Sheet 'MAT Credit Entitlement' asset is not."""
+    items = [("[INC] Revenue", 18498578), ("Current tax", 3108354), ("MAT Credit", 3219297)]
+    buckets, unmapped, _i = T.map_items(items, {})
+    assert not unmapped
+    assert T.compute(buckets)["profit_after_tax"] == 12170927
+    assert T.map_label("[NCA] MAT Credit Entitlement", {}) != "provision_deferred_tax"
+    assert T.map_label("Basic & Diluted", {}) is T.IGNORE
+
+
+# ── Several files for one case ───────────────────────────────────
+
+def _doc(name, year, blocks):
+    return {"source_name": name, "identity": {}, "scanned": False,
+            "book_profit": None, "book_profit_page": None, "pages_total": 3,
+            "pages_used": 2, "page_summary": {"statement": 1}, "blocks": blocks,
+            "vision_pages": [], "year": year}
+
+
+def _bs(year, amount, src, status=F.VERIFIED):
+    return {"kind": F.BALANCE_SHEET, "year": year, "status": status,
+            "entity": "Borrower H", "page": 0, "source": src, "title": "",
+            "unit_scale": 1, "check": {"reason": ""},
+            "sides": {"left": [("Share Capital", amount)],
+                      "right": [("Fixed Assets", amount)]}}
+
+
+def test_statements_are_pooled_by_their_own_year_across_files(monkeypatch):
+    """
+    Borrower H: 'ITR 2022-2023.pdf' holds the FY2023 AND the FY2024 Balance Sheet,
+    the audit report reprints FY2024, and a loan offer letter sits in the same
+    upload. One column per YEAR - not per file - with the reprint dropped and
+    the letter noted, not given a column.
+    """
+    docs = {
+        "ITR 2022-2023.pdf": _doc("ITR 2022-2023.pdf", 2023,
+                                  [_bs(2023, 100, "ITR 2022-2023.pdf"),
+                                   _bs(2024, 250, "ITR 2022-2023.pdf", F.UNVERIFIED)]),
+        "Audit Report.pdf": _doc("Audit Report.pdf", 2024,
+                                 [_bs(2024, 250, "Audit Report.pdf")]),
+        "BUS LOI.pdf": _doc("BUS LOI.pdf", None, []),
+    }
+    monkeypatch.setattr(COL, "_read_document", lambda src, *a, **k: docs[src])
+    cols = COL.spread_many(list(docs), extract_fn=None)
+    assert [c["year"] for c in cols] == [2023, 2024]
+    fy24 = cols[1]
+    assert len(fy24["blocks_used"]) == 1                     # reprint dropped
+    assert fy24["blocks_used"][0]["status"] == F.VERIFIED    # best reading kept
+    assert "Audit Report.pdf" in fy24["source_name"]
+    assert fy24["values"]["equity_capital"] == 250
+    assert any("BUS LOI.pdf" in w for w in cols[0]["warnings"])
+
+
+def _pl(year, dep, src, entity="Borrower R"):
+    return {"kind": F.PROFIT_LOSS, "year": year, "status": F.VERIFIED,
+            "entity": entity, "page": 0, "source": src, "title": "",
+            "unit_scale": 1, "check": {"reason": ""},
+            "sides": {"left": [("[EXP] Depreciation", dep)],
+                      "right": [("[INC] Sales", dep * 10)]}}
+
+
+def test_a_misdated_page_stays_with_its_file_when_the_other_year_has_it(monkeypatch):
+    """
+    Borrower R: page 2 of the FY2025 P&L read as 2024. FY2024 already has
+    this business's P&L from the FY2024 file, so the page must stay in FY2025
+    - moved, FY2025 lost its depreciation and interest.
+    """
+    docs = {
+        "ITR 2023-2024.pdf": _doc("ITR 2023-2024.pdf", 2024,
+                                  [_pl(2024, 27, "ITR 2023-2024.pdf")]),
+        "ITR 2024-2025.pdf": _doc("ITR 2024-2025.pdf", 2025,
+                                  [_pl(2025, 0, "ITR 2024-2025.pdf"),
+                                   _pl(2024, 42, "ITR 2024-2025.pdf")]),   # misdated
+    }
+    monkeypatch.setattr(COL, "_read_document", lambda src, *a, **k: docs[src])
+    cols = COL.spread_many(list(docs), extract_fn=None)
+    by_year = {c["year"]: c for c in cols}
+    assert by_year[2025]["values"]["depreciation"] == 42
+    assert by_year[2024]["values"]["depreciation"] == 27
+
+
+def test_a_reprint_of_another_years_statement_moves_and_is_deduped(monkeypatch):
+    """
+    Borrower H: 'ITR 2023-2024.pdf' (about FY2024) also reprints the FY2025
+    Balance Sheet - same figures as the audit report's. It must go to FY2025
+    (and be dropped there as a duplicate), not be added to FY2024's own.
+    """
+    fy25 = _bs(2025, 2942, "Audit Report.pdf")
+    reprint = _bs(2025, 2942, "ITR 2023-2024.pdf")
+    reprint["entity"] = "Borrower H"
+    docs = {
+        "Audit Report.pdf": _doc("Audit Report.pdf", 2025, [fy25]),
+        "ITR 2023-2024.pdf": _doc("ITR 2023-2024.pdf", 2024,
+                                  [_pl(2024, 50, "ITR 2023-2024.pdf", "Borrower H"),
+                                   _bs(2024, 2419, "ITR 2023-2024.pdf"), reprint]),
+    }
+    monkeypatch.setattr(COL, "_read_document", lambda src, *a, **k: docs[src])
+    cols = {c["year"]: c for c in COL.spread_many(list(docs), extract_fn=None)}
+    assert cols[2024]["values"]["equity_capital"] == 2419       # not 2419 + 2942
+    assert cols[2025]["values"]["equity_capital"] == 2942       # counted once
+
+
+def test_an_undated_statement_takes_the_date_of_its_neighbour():
+    """
+    Borrower O: 'ITR 23-24.pdf' (AY 2024-25) holds the Balance Sheet
+    'as on 31.03.2023' on page 2 and an UNDATED P&L on page 3. The P&L
+    belongs with its Balance Sheet (FY2023), not with the ITR's year.
+    """
+    bs = {"kind": F.BALANCE_SHEET, "year": 2023, "page": 1, "entity": "Borrower D"}
+    pl = {"kind": F.PROFIT_LOSS, "year": None, "page": 2, "entity": "Borrower D"}
+    far = {"kind": F.PROFIT_LOSS, "year": None, "page": 9, "entity": "Borrower D"}
+    COL._infer_missing_years([bs, pl, far])
+    assert pl["year"] == 2023 and pl["year_inferred"]
+    assert far["year"] is None          # too far away to be its pair
+
+
+def test_file_year_tie_is_broken_by_the_assessment_year():
+    blocks = [{"year": 2023}, {"year": 2024}]
+    assert COL._fy_end_year(blocks, {"ay": "2023-24"}) == 2023
+    assert COL._fy_end_year(blocks, {"ay": "2024-25"}) == 2024
+    assert COL._fy_end_year(blocks, {}) == 2023
+
+
+def test_an_unreadable_file_does_not_cost_the_others_their_columns(monkeypatch):
+    def read(src, *a, **k):
+        if src == "broken.pdf":
+            raise ValueError("encrypted")
+        return _doc(src, 2024, [_bs(2024, 10, src)])
+    monkeypatch.setattr(COL, "_read_document", read)
+    cols = COL.spread_many(["good.pdf", "broken.pdf"], extract_fn=None)
+    assert [c["year"] for c in cols] == [2024]
+    assert any("broken.pdf" in w and "encrypted" in w for w in cols[0]["warnings"])
 
 
 # ── Analysis ─────────────────────────────────────────────────────
@@ -580,3 +776,238 @@ def test_trends_skip_non_consecutive_years():
 def test_cagr():
     cols = [_col(2023), _col(2025, sales_other_income=121_00_000)]
     assert abs(A.cagr(cols) - 0.10) < 1e-9
+
+
+# ── Schedules ────────────────────────────────────────────────────
+
+def _rows(*lines):
+    """page rows from 'label || amount || amount' strings."""
+    out = []
+    for n, ln in enumerate(lines):
+        cells = [(i * 200, i * 200 + 150, t.strip()) for i, t in enumerate(ln.split("||"))]
+        out.append((n * 10, cells))
+    return out
+
+
+_sample_e_SCHEDULES = _rows(
+    "Note Forming part of Profit & Loss Account for the Year ended 31-03-2023",
+    "Sch o8 Direct Expenses",
+    "Sr. No. Particulars || Amount (Rs.) Amount (Rs.)",
+    "A Direct Expenses",
+    "Transport Charges Paid || 1,73,42,490",
+    "Disel & Oil Expenses || 8,81,593",
+    "Stipend, Salary and Wages || 2,87,60,157 || 4,69,84,240",
+    "Total || 4,69,84,240",
+    "Sch o9 Indirect Expenses",
+    "To Staff Welfare Expenses || 13,56,019",
+    "To Interest on loan || 3,12,459",
+    "To Other Charges || 6,01,336",
+    "22,69,814",
+    "Total || 22,69,814",
+)
+
+
+def test_schedule_read_and_proved_by_its_own_total():
+    """
+    Borrower E FY2023: the P&L face prints only Direct / Indirect
+    Expenses. The schedules behind them are read, the running group total on
+    the last line ('2,87,60,157 | 4,69,84,240') is not taken as a line, and
+    each schedule verifies against the Total it prints.
+    """
+    sch = F.find_schedules([_sample_e_SCHEDULES])
+    assert [(s["number"], s["name"], s["verified"]) for s in sch] == [
+        ("08", "Direct Expenses", True), ("09", "Indirect Expenses", True)]
+    assert sch[0]["items"][2] == ("Stipend, Salary and Wages", 28760157)
+
+
+def test_notes_heading_is_not_a_schedule():
+    assert F._schedule_heading("Notes Forming part of the Balance Sheet") is None
+    assert F._schedule_heading("Note 15 : Employee benefits expense") == (
+        "15", "Employee benefits expense")
+    assert F._schedule_heading("Schedule E - Cash and Bank") == ("E", "Cash and Bank")
+
+
+def test_pl_group_lines_replaced_by_their_schedules():
+    block = {"kind": F.PROFIT_LOSS, "unit_scale": 1, "sides": {
+        "left": [("[EXP] Direct Expenses", 46984240),
+                 ("[EXP] Indirect Expenses", 2269814),
+                 ("[EXP] Depreciation", 1088440)],
+        "right": [("[INC] Sales", 53581608)]}}
+    used = F.expand_with_schedules(block, F.find_schedules([_sample_e_SCHEDULES]))
+    labels = [l for l, _a in block["sides"]["left"]]
+    assert "[EXP] Stipend, Salary and Wages" in labels
+    assert "[EXP] To Interest on loan" in labels
+    assert "[EXP] Direct Expenses" not in labels
+    assert sum(a for _l, a in block["sides"]["left"]) == 46984240 + 2269814 + 1088440
+    assert len(used) == 2
+
+
+def test_schedule_not_used_unless_it_proves_itself():
+    """A schedule whose lines miss its total, or whose total is not the
+    group line's amount, leaves the face line alone. So does Other expenses."""
+    bad = _rows("Sch 09 Indirect Expenses", "Staff Welfare || 13,56,019",
+                "Total || 22,69,814")
+    for sides, schedules in [
+            ({"left": [("[EXP] Indirect Expenses", 2269814)], "right": []}, bad),
+            ({"left": [("[EXP] Indirect Expenses", 9999999)], "right": []},
+             _sample_e_SCHEDULES),
+            ({"left": [("[EXP] Other Expenses", 2269814)], "right": []},
+             _sample_e_SCHEDULES)]:
+        block = {"kind": F.PROFIT_LOSS, "unit_scale": 1, "sides": sides}
+        before = list(sides["left"])
+        assert F.expand_with_schedules(block, F.find_schedules([schedules])) == []
+        assert block["sides"]["left"] == before
+
+
+def test_schedule_labels_map_to_their_rows():
+    """Borrower E's schedule lines: statutory contributions are employee cost,
+    the plural 'Repairs' and the misspelt 'Disel' are operating cost - and a
+    PF liability is not an expense."""
+    learned = {}
+    want = {"[EXP] To ESIC Paid": "employee_costs",
+            "[EXP] To PF Paid": "employee_costs",
+            "[EXP] To Repairs and Maintenance": "transport_admin",
+            "[EXP] Disel & Oil Expenses": "transport_admin"}
+    for label, bucket in want.items():
+        buckets, _u, _i = T.map_items([(label, 100)], learned)
+        assert list(buckets) == [bucket], label
+    buckets, _u, _i = T.map_items([("[CL] PF Payable", 100)], learned)
+    assert "employee_costs" not in buckets
+
+
+_sample_i_SCHEDULE = _rows(
+    "Notes to the financial statements for the year ended as on 31st March 2024",
+    "Schedule H : Éxpenses",
+    "Direct expenses",
+    "Petrol and diesel expenses || 6,81,68,409",
+    "Vehicle hiring charges || 5,08,46,237",
+    "Total || 11,90,14,646",
+    "Indirect expenses",
+    "Interest on loan || 6,31,65,467",
+    "Salary || 88,11,01,546",
+    "Depreciation || 15,58,76,792",
+    "Total || 1,10,01,43,805",
+)
+
+
+def test_one_schedule_heading_holding_two_groups():
+    """Borrower I FY2024: 'Schedule H' holds Direct and Indirect expenses,
+    each closed by its own Total; the accented OCR heading still reads."""
+    sch = F.find_schedules([_sample_i_SCHEDULE])
+    assert [(s["number"], s["caption"], s["verified"]) for s in sch] == [
+        ("H", "Direct expenses", True), ("H", "Indirect expenses", True)]
+
+
+def test_schedule_line_the_face_prints_separately_is_not_doubled():
+    """The Indirect schedule includes Depreciation, which the P&L face also
+    prints on its own line: 110.01 cr = 94.43 cr + 15.59 cr. Expanded without
+    it, so depreciation is counted once and the total is unchanged."""
+    items = [("[EXP] Direct expenses", 119014646),
+             ("[EXP] Indirect expenses", 944267013),
+             ("[EXP] Depreciation", 155876792)]
+    block = {"kind": F.PROFIT_LOSS, "unit_scale": 1, "sides": {"sections": [
+        {"name": "Total Expenses", "items": list(items), "total": None}]}}
+    used = F.expand_with_schedules(block, F.find_schedules([_sample_i_SCHEDULE]))
+    got = block["sides"]["sections"][0]["items"]
+    assert len(used) == 2
+    assert [l for l, _a in got].count("[EXP] Depreciation") == 1
+    assert "[EXP] Salary" in [l for l, _a in got]
+    assert sum(a for _l, a in got) == sum(a for _l, a in items)
+
+
+# ── The comparative column as a year of its own ──────────────────
+
+def _comp_bs(year, amount, src):
+    """A prior-year Balance Sheet taken from the next year's comparative
+    column (financials.find_blocks marks these)."""
+    b = _bs(year, amount, src)
+    b["from_comparative"] = True
+    return b
+
+
+def test_comparative_year_is_used_when_no_file_covers_it(monkeypatch):
+    """
+    sample_d's provisional set is FY2026 only, but both statements print FY2025
+    beside it line for line. That year has no statement of its own anywhere
+    in the upload, so the comparative column becomes its column.
+    """
+    docs = {"provisional.pdf": _doc("provisional.pdf", 2026,
+                                    [_bs(2026, 300, "provisional.pdf"),
+                                     _comp_bs(2025, 250, "provisional.pdf")])}
+    monkeypatch.setattr(COL, "_read_document", lambda src, *a, **k: docs[src])
+    cols = {c["year"]: c for c in COL.spread_many(list(docs), extract_fn=None)}
+    assert sorted(cols) == [2025, 2026]
+    assert cols[2025]["values"]["equity_capital"] == 250
+    assert cols[2026]["values"]["equity_capital"] == 300
+    assert any("comparative" in w.lower() for w in cols[2025]["warnings"])
+
+
+def test_a_real_statement_beats_the_comparative_for_the_same_year(monkeypatch):
+    """The borrower's own FY2025 filing is the better reading: the next
+    year's comparative column must not be pooled alongside it (it would be
+    added to it, doubling the year), nor replace it."""
+    docs = {
+        "FY2025.pdf": _doc("FY2025.pdf", 2025, [_bs(2025, 251, "FY2025.pdf")]),
+        "FY2026.pdf": _doc("FY2026.pdf", 2026,
+                           [_bs(2026, 300, "FY2026.pdf"),
+                            _comp_bs(2025, 250, "FY2026.pdf")]),
+    }
+    monkeypatch.setattr(COL, "_read_document", lambda src, *a, **k: docs[src])
+    cols = {c["year"]: c for c in COL.spread_many(list(docs), extract_fn=None)}
+    assert cols[2025]["values"]["equity_capital"] == 251
+    assert not any(b.get("from_comparative") for b in cols[2025]["blocks_used"])
+    # Nor may it drift into the year it was PRINTED in, which would add
+    # last year's figures to this year's.
+    assert cols[2026]["values"]["equity_capital"] == 300
+
+
+def test_column_never_titles_itself_after_an_implausible_entity(monkeypatch):
+    """_main_entity screens candidates through _belongs_to, but the column's
+    own fallback took the first block's entity whatever it was - so a line
+    already rejected as a name (an address, a sentence) still titled the
+    workbook. Confirmed on Borrower D' statements."""
+    address = ("6-A, H & G House, Sector 11, C B D Belapur, Navi Mumbai, "
+               "Maharashtra, India, 400614")
+    b = _bs(2026, 100, "sample_d.pdf")
+    b["entity"] = address
+    docs = {"sample_d.pdf": _doc("sample_d.pdf", 2026, [b])}
+    monkeypatch.setattr(COL, "_read_document", lambda src, *a, **k: docs[src])
+    col = COL.spread_many(list(docs), extract_fn=None)[0]
+    assert col["entity"] != address
+    assert col["values"]["equity_capital"] == 100      # the figures still stand
+
+
+def test_two_different_statements_of_one_kind_both_survive():
+    """
+    A petrol pump's accounts print a Trading ("PUMP ACCOUNT") and a Profit &
+    Loss on the SAME page, both profit_loss, neither naming an entity - so
+    both share the (entity, kind, year) key. Keeping only the "best" of them
+    threw the trading account away and with it the year's whole turnover:
+    Borrower B FY2025 read Rs 21.71 lakh of income against Rs 1,659.38
+    printed. They are complementary statements, not two readings of one - as
+    their figures show, sharing nothing.
+    """
+    trading = {"kind": F.PROFIT_LOSS, "year": 2025, "status": F.VERIFIED, "entity": "",
+               "page": 5, "source": "fy25.pdf", "title": "PUMP ACCOUNT", "unit_scale": 1,
+               "check": {"reason": ""},
+               "sides": {"left": [("[EXP] Purchases", 161288000)],
+                         "right": [("[INC] Sales", 163766000)]}}
+    pl = {"kind": F.PROFIT_LOSS, "year": 2025, "status": F.VERIFIED, "entity": "",
+          "page": 5, "source": "fy25.pdf", "title": "PROFIT AND LOSS ACCOUNT",
+          "unit_scale": 1, "check": {"reason": ""},
+          "sides": {"left": [("[EXP] Salary", 1224000), ("[EXP] Audit Fees", 20000)],
+                    "right": [("[INC] Rent received", 97000)]}}
+    kept = COL._dedupe([trading, pl])
+    assert {b["title"] for b in kept} == {"PUMP ACCOUNT", "PROFIT AND LOSS ACCOUNT"}
+
+
+def test_a_reprint_of_the_same_statement_is_still_dropped():
+    """The guard this loosens must hold: the same figures read twice are one
+    statement, and counting both doubles the year."""
+    a = {"kind": F.PROFIT_LOSS, "year": 2025, "status": F.VERIFIED, "entity": "",
+         "page": 1, "source": "a.pdf", "title": "P&L", "unit_scale": 1,
+         "check": {"reason": ""},
+         "sides": {"left": [("[EXP] Salary", 1224000), ("[EXP] Audit Fees", 20000)],
+                   "right": [("[INC] Sales", 163766000)]}}
+    b = dict(a, title="P&L (reprint)", page=9, status=F.UNVERIFIED)
+    assert len(COL._dedupe([a, b])) == 1

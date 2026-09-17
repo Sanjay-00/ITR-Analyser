@@ -10,7 +10,7 @@ formula text.
 
 Deliberately small: it understands exactly the grammar excel_generator
 emits - numbers, cell references, A1:B9 ranges, + - * /, parentheses,
-SUM(...) and IFERROR(x, y). Anything else raises, so a new formula shape
+SUM(...), IFERROR(x, y) and ABS(x). Anything else raises, so a new shape
 fails loudly in the tests instead of being silently mis-evaluated.
 """
 
@@ -20,7 +20,7 @@ from openpyxl.utils import column_index_from_string, get_column_letter
 
 _TOKEN = re.compile(
     r"\s*(?:(?P<num>\d+(?:\.\d+)?)|(?P<ref>\$?[A-Z]{1,3}\$?\d+(?::\$?[A-Z]{1,3}\$?\d+)?)"
-    r"|(?P<func>SUM|IFERROR)\s*\(|(?P<op>[+\-*/(),])|(?P<str>\"[^\"]*\"))")
+    r"|(?P<func>SUM|IFERROR|ABS)\s*\(|(?P<op>[+\-*/(),])|(?P<str>\"[^\"]*\"))")
 
 
 class _Error(Exception):
@@ -139,6 +139,10 @@ class SheetEvaluator:
                 break
             self._expect(")")
             return total
+        if kind == "func" and tok.startswith("ABS"):
+            v = self._expr()
+            self._expect(")")
+            return abs(_num_or_zero(v))
         if kind == "func" and tok.startswith("IFERROR"):
             start = self._i
             try:

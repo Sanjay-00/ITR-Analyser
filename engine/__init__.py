@@ -18,13 +18,14 @@ internals move or split further without touching the UI.
 """
 
 from .parser import spread, extract_text, vision_read
-from .excel_generator import generate_excel, get_filename, ROWS, SNAP_ROWS, LAKH
+from .excel_generator import (generate_excel, get_filename, borrower_name,
+                              ROWS, SNAP_ROWS, LAKH)
 from .extract import financials
 from .mapping import taxonomy
 from . import analysis
 
 __all__ = [
     "spread", "extract_text", "vision_read",
-    "generate_excel", "get_filename", "ROWS", "SNAP_ROWS", "LAKH",
+    "generate_excel", "get_filename", "borrower_name", "ROWS", "SNAP_ROWS", "LAKH",
     "financials", "taxonomy", "analysis",
 ]

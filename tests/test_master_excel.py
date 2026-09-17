@@ -29,7 +29,7 @@ L = 100000
 MASTER_LABELS = [
     "PROFIT AND LOSS ACCOUNT", "Income", "Sales and other Income", "Gross Receipts",
     "Expenses", "Purchases & Raw Material", "Transport operation and admin charges",
-    "Electricity", "Employee Costs", "Other Expenses", "Interest and Finance Expenses",
+    "Employee Costs", "Other Expenses", "Interest and Finance Expenses",
     "Depreciation", "Extra Ordinary Item", "Gross Expenses", "Profit before tax",
     "Provision for tax", "Provision for Deferred Tax", "Profit after tax",
     "Preference dividend (including tax)", "Profit available for equity shareholders",
@@ -45,15 +45,15 @@ MASTER_LABELS = [
     "PAT / Income (%)", "PAT / Assets employed (%)",
     "Long Term Debt / Equity (inclusive q/e)", "Total Debt / Equity(inclusive q/e)",
     "Interest Coverage", "Current Ratio", "DSCR", "Debtor Days", "Creditor Days",
-    "DSCR Calculation", "Particular", "Net Profit", "Depreciation",
-    "Interest (Including CC/OD interest)", "Total (A)", "Existing Monthly EMI",
-    "Proposed Loan EMI", "Yearly Obligation (B)", "Total (B)", "DSCR (A/B)",
     "Turnover and Other Income", "PAT", "Cash Profit", "Networth",
     "Secured Loans - Long Term", "Secured Loans – CC / OD",
     "Current Liabilities and Provisions", "Fixed Assets",
     "Current Assets , ST Loans & Advances ", "Ratios", "PAT/Income  (%)",
     "Long Term Debt / Equity (including Q/E)", "TOL/TNW (including Q/E)",
     "Interest Coverage", "Current Ratio", "DSCR", "Debtor Days", "Creditor Days",
+    "Year-on-year growth", "Sales and other Income", "Gross Expenses",
+    "Profit before tax", "Profit after tax", "Cash Profit", "Total of Assets",
+    "Total of Liabilities",
 ]
 
 
@@ -136,25 +136,71 @@ def test_unread_year_is_zero_but_flagged_and_formulas_still_work(sheet):
     assert cell.comment is not None and "Not read" in cell.comment.text
     # Every formula must still evaluate on an all-zero column - each ratio
     # divides by zero there and must fall back to 0 through its IFERROR.
-    for label in ["Profit after tax", "Total of Assets", "DSCR (A/B)"] + C.RATIO_NAMES:
+    for label in ["Profit after tax", "Total of Assets"] + C.RATIO_NAMES:
         assert ev.value(f"C{_row(ws, label)}") == pytest.approx(0), label
 
 
 def test_snap_repeats_the_sheet(sheet):
     ws, ev, _ = sheet
-    snap_start = _row(ws, "DSCR (A/B)")
+    snap_start = _row(ws, "Turnover and Other Income") - 1
     assert ev.value(f"B{_row(ws, 'Networth', snap_start)}") == pytest.approx(250)
     assert ev.value(f"B{_row(ws, 'Current Assets , ST Loans & Advances ', snap_start)}") \
         == pytest.approx(245)
-    assert ev.value(f"B{_row(ws, 'Debtor Days', snap_start + 20)}") \
+    assert ev.value(f"B{_row(ws, 'Debtor Days', _row(ws, 'Ratios', snap_start))}") \
         == pytest.approx(90 / 500 * 365)
 
 
-def test_dscr_block_follows_the_format(sheet):
+def test_growth_block_closes_the_sheet(sheet):
+    """The sheet ends with year-on-year growth, as LIVE formulas off the rows
+    above (the analyst's own "ITR - Borrower D" workbook, 2026-09-16):
+    correct a figure and its growth follows. The first year has nothing to
+    compare against and shows "-"."""
     ws, ev, _ = sheet
-    total_a = _row(ws, "Total (A)")
-    assert ev.value(f"B{total_a}") == pytest.approx(35 + 50 + 30)
-    oblig = _row(ws, "Yearly Obligation (B)")
-    assert "*12" in ws.cell(row=oblig, column=2).value
-    assert ws.cell(row=oblig, column=2).value.endswith("*4)")     # audited
-    assert ws.cell(row=oblig, column=3).value.endswith("*1)")     # provisional
+    head = _row(ws, "Year-on-year growth")
+    sales = _row(ws, "Sales and other Income", head)
+    assert ws.cell(row=sales, column=2).value == "-"
+    formula = ws.cell(row=sales, column=3).value
+    assert formula.startswith("=(C") and "ABS(B" in formula
+    # FY2025 in the fixture is unread, so growth off a 500 base is -100%.
+    assert ev.value(f"C{sales}") == pytest.approx(-1.0)
+    assert ws.cell(row=sales, column=3).number_format.startswith("0.0%")
+
+
+def test_each_figure_shows_the_lines_it_adds_up():
+    """
+    Transparency: a figure made of several statement lines is written as
+    their live sum ("=1.2+0.1+0.05"), with a note naming each line, its page
+    and file - and the Audit Trail lists them all. A single-line figure keeps
+    its plain value but still carries the note.
+    """
+    col = _column(2024, BUCKETS)
+    col["sources"] = {
+        "secured_loan_ccod": [
+            {"label": "SBI Cash Credit", "amount": 25 * L, "page": 6, "file": "ITR 2024.pdf"},
+            {"label": "HDFC OD", "amount": 15 * L, "page": 6, "file": "ITR 2024.pdf"}],
+        "purchases": [
+            {"label": "Purchases", "amount": 200 * L, "page": 7, "file": "ITR 2024.pdf"}],
+    }
+    wb = load_workbook(io.BytesIO(generate_excel([col])))
+    ws = wb["ITR Validation"]
+    ev = SheetEvaluator(ws)
+    cc = ws.cell(row=_row(ws, "Secured loan - CC/OD"), column=2)
+    assert cc.value == "=25+15"
+    assert ev.value(cc.coordinate) == pytest.approx(40)
+    assert "SBI Cash Credit" in cc.comment.text and "p6" in cc.comment.text
+    pur = ws.cell(row=_row(ws, "Purchases & Raw Material"), column=2)
+    assert pur.value == pytest.approx(200) and "Purchases" in pur.comment.text
+    # Totals still work on top of the summed cells.
+    assert ev.value(f"B{_row(ws, 'Total of Liabilities')}") == pytest.approx(695)
+    audit = [c.value for r in wb["Audit Trail"].iter_rows() for c in r]
+    assert "HDFC OD" in audit and "Secured loan - CC/OD" in audit
+
+
+def test_breakdown_not_written_when_it_does_not_add_up():
+    """Never show a sum that disagrees with the figure itself."""
+    col = _column(2024, BUCKETS)
+    col["sources"] = {"secured_loan_ccod": [
+        {"label": "SBI Cash Credit", "amount": 25 * L, "page": 6, "file": "x.pdf"}]}
+    ws = load_workbook(io.BytesIO(generate_excel([col])))["ITR Validation"]
+    cc = ws.cell(row=_row(ws, "Secured loan - CC/OD"), column=2)
+    assert cc.value == pytest.approx(40) and cc.comment is None

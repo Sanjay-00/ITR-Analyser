@@ -8,6 +8,7 @@ comments say which, because the failure modes are not obvious from the code.
 """
 
 import os
+import re
 import sys
 
 import pytest
@@ -721,3 +722,493 @@ def test_harvest_vertical_comparative_empty_without_a_second_column():
     ]]
     result = F._harvest_vertical(rows)
     assert result["comparative"] == {}
+
+
+# ── A genuine two-digit amount in the period column ──────────────
+#    Borrower D FY2025 (docs/SHORTCOMINGS.md Case 28): the P&L
+#    prints "(f) Finance costs | 30 | 63 | 1,25,03,233" - a real Rs 63
+#    finance cost beside its Note No. 30. A bare 1-2 digit figure was
+#    unreadable by design (a guard against harvesting note numbers), so
+#    the row carried no amount, was taken for a heading and dropped; the
+#    expense section then came up Rs 62 short of its printed total and
+#    the whole P&L failed - taking Revenue, Purchases, Employee Costs and
+#    every P&L row with it.
+#
+#    Figures are RIGHT-ALIGNED under their column: the real amount's right
+#    edge sits with the other amounts of its period, the note number's does
+#    not. That is what tells them apart - not the digit count.
+
+def _sample_d_rows():
+    """The sample_d layout: label | note | this year (right-aligned at 560) |
+    last year (right-aligned at 760)."""
+    return [rows_with_cells(r, 900)[0] for r in [
+        [_w(10, 0, 200, "Particulars"), _w(300, 0, 340, "Note"),
+         _w(400, 0, 520, "For Year Ended 31.03.2025"),
+         _w(620, 0, 740, "31.03.2024")],
+        [_w(10, 20, 200, "(a) Cost of materials consumed"), _w(300, 20, 330, "24")],
+        [_w(10, 40, 200, "(b) Purchases of Stock In Trade"), _w(300, 40, 330, "25"),
+         _w(430, 40, 560, "8,84,09,944"), _w(630, 40, 760, "13,70,17,989")],
+        [_w(10, 60, 200, "(f) Finance costs"), _w(300, 60, 330, "30"),
+         _w(540, 60, 560, "63"), _w(640, 60, 760, "1,25,03,233")],
+        [_w(10, 80, 200, "Total expenses"),
+         _w(430, 80, 560, "8,84,10,007"), _w(630, 80, 760, "14,95,21,222")],
+    ]]
+
+
+def test_two_digit_amount_in_the_period_column_is_read():
+    sides = F._harvest_vertical(_sample_d_rows())
+    items = {l: a for s in sides["sections"] for l, a in s["items"]}
+    assert items.get("(f) Finance costs") == 63
+    assert items.get("(b) Purchases of Stock In Trade") == 88409944
+    section = sides["sections"][0]
+    assert sum(a for _l, a in section["items"]) == section["total"] == 88410007
+
+
+def test_note_number_is_still_never_an_amount():
+    """The guard this loosens must still hold: a row whose only figure is
+    its Note No. ('Cost of materials consumed | 24 | - | -') contributes
+    nothing - reading 24 as Rs 24 is the failure the 3-digit rule exists
+    to prevent."""
+    sides = F._harvest_vertical(_sample_d_rows())
+    labels = [l for s in sides["sections"] for l, _a in s["items"]]
+    assert not any("Cost of materials" in l for l in labels)
+    assert 24 not in [a for s in sides["sections"] for _l, a in s["items"]]
+
+
+# ── "Total outstanding dues ..." is a line item, not a section total ──
+#    Schedule III spells trade payables out longhand as two lines, each
+#    OPENING with the word "total":
+#        (a) Trade payables
+#            total outstanding dues of micro enterprises ...
+#            total outstanding dues of creditors other than micro ...  4,32,24,860
+#    Read as a section anchor (Borrower D FY2025), each closed the
+#    Current liabilities group: the payables figure became a section total
+#    with no items and vanished from the sheet, and the lines BELOW it lost
+#    their [CL] tag - so "(c) Current tax liabilities (net)" was mapped as a
+#    P&L tax expense. Total of Liabilities came up Rs 499 lakh short of
+#    Total of Assets, and PAT was overstated as a loss by Rs 66.75 lakh.
+
+def _payables_rows():
+    return [rows_with_cells(r, 900)[0] for r in [
+        [_w(10, 0, 200, "Particulars"), _w(300, 0, 340, "Note"),
+         _w(400, 0, 520, "For Year Ended 31.03.2025"), _w(620, 0, 740, "31.03.2024")],
+        [_w(10, 20, 200, "3 Current liabilities")],
+        [_w(10, 40, 200, "(a) Trade payables")],
+        [_w(10, 60, 360, "total outstanding dues of micro enterprises and small enterprises"),
+         _w(545, 60, 560, "-")],
+        [_w(10, 80, 360, "total outstanding dues of creditors other than micro enterprises"),
+         _w(430, 80, 560, "4,32,24,860")],
+        [_w(10, 100, 200, "(c) Current tax liabilities (net)"), _w(300, 100, 330, "7"),
+         _w(440, 100, 560, "66,75,420")],
+        [_w(10, 120, 200, "Total current liabilities"), _w(430, 120, 560, "4,99,00,280")],
+    ]]
+
+
+def test_trade_payables_longhand_is_an_item_not_a_section_total():
+    sides = F._harvest_vertical(_payables_rows())
+    items = {l: a for s in sides["sections"] for l, a in s["items"]}
+    payables = [a for l, a in items.items() if "outstanding dues" in l]
+    assert payables == [43224860]
+    section = next(s for s in sides["sections"] if "current liabilities" in s["name"].lower())
+    assert section["total"] == 49900280
+    assert sum(a for _l, a in section["items"]) == 49900280
+
+
+def test_lines_below_trade_payables_keep_their_section_tag():
+    """The tag decides the row: untagged, 'Current tax liabilities' reads as
+    the P&L's current tax expense instead of a balance-sheet liability."""
+    from engine.mapping import taxonomy as T
+    sides = F._harvest_vertical(_payables_rows())
+    tax = next(l for s in sides["sections"] for l, _a in s["items"]
+               if "Current tax liabilities" in l)
+    assert tax.startswith("[CL]")
+    assert T.map_label(tax, {}) == "current_liabilities"
+
+
+def test_trade_payables_longhand_is_not_ignored_as_a_subtotal():
+    """The mapping layer drops "Total ..." rows as restatements. Schedule
+    III's trade-payables wording opens with the same word, so Rs 432.25 lakh
+    of creditors was set aside as a subtotal and never reached the sheet -
+    Total of Liabilities was short by exactly that (sample_d FY2025). A real
+    subtotal must still be ignored."""
+    from engine.mapping import taxonomy as T
+    payables = "[CL] total outstanding dues of creditors other than micro and small enterprises"
+    micro = "[CL] total outstanding dues of micro and small enterprises"
+    assert T.map_label(payables, {}) == "sundry_creditors"
+    assert T.map_label(micro, {}) == "sundry_creditors"
+    assert T.map_label("[CL] Total current liabilities", {}) is T.IGNORE
+    assert T.map_label("Total expenses", {}) is T.IGNORE
+
+
+# ── A two-digit year in the heading ───────────────────────────────
+#    "PROVISIONAL PROFIT AND LOSS ACCOUNT FOR THE YEAR ENDED 31.03.26"
+#    (Borrower D provisional set). _PERIOD_RE wanted four digits, so
+#    the statement had no period: it could not join the Balance Sheet dated
+#    31st March 2026 from the other file and became its own undated column -
+#    the year showed a P&L with no balance sheet and a balance sheet with no
+#    P&L, side by side.
+
+def test_two_digit_year_in_a_heading_is_understood():
+    lines = ["PROVISIONAL PROFIT AND LOSS ACCOUNT FOR THE YEAR ENDED 31.03.26"]
+    assert F._find_period(lines, 0)[0] == 2026
+    assert F._find_period(["Balance Sheet as at 31/03/25"], 0)[0] == 2025
+    # Four-digit years and month-name spellings keep working.
+    assert F._find_period(["Balance Sheet as at 31st March, 2026"], 0)[0] == 2026
+    assert F._find_period(["for the year ended 31.03.2026"], 0)[0] == 2026
+    # A bare two-digit number that is not a date must not become a year.
+    assert F._find_period(["Total expenses 26"], 0)[0] is None
+
+
+# ── The comparative column as a year of its own ───────────────────
+#    A Schedule III statement prints last year beside this year, line for
+#    line. Borrower D' provisional set (FY2026) carries the whole of
+#    FY2025 that way, and a case can arrive with no separate FY2025 file at
+#    all. The comparative column is emitted as a SECOND statement for the
+#    prior year, so it is checked against its own printed totals like any
+#    other - and a real statement for that year always wins over it
+#    (see columns.spread_many).
+
+def _two_period_rows():
+    """sample_d's provisional P&L: FY2026 beside FY2025, line for line."""
+    return [rows_with_cells(r, 900)[0] for r in [
+        [_w(10, 0, 200, "Particulars"), _w(300, 0, 340, "Note"),
+         _w(400, 0, 520, "For Year Ended 31.03.2026"),
+         _w(600, 0, 740, "For Year Ended 31.03.2025")],
+        [_w(10, 20, 200, "I. Revenue from operations"), _w(300, 20, 330, "22"),
+         _w(430, 20, 560, "9,01,43,224"), _w(630, 20, 760, "9,52,43,661")],
+        [_w(10, 40, 200, "II. Other income"), _w(300, 40, 330, "23"),
+         _w(470, 40, 560, "1,45,306"), _w(680, 40, 760, "50,856")],
+        [_w(10, 60, 200, "III. Total income"),
+         _w(430, 60, 560, "9,02,88,530"), _w(630, 60, 760, "9,52,94,517")],
+        [_w(10, 80, 200, "(b) Purchases of Stock In Trade"), _w(300, 80, 330, "25"),
+         _w(430, 80, 560, "6,08,35,520"), _w(630, 80, 760, "8,84,09,944")],
+        [_w(10, 100, 200, "(e) Employee benefits expenses"), _w(300, 100, 330, "28"),
+         _w(460, 100, 560, "30,55,266"), _w(660, 100, 760, "44,35,992")],
+        [_w(10, 120, 200, "Total expenses"),
+         _w(430, 120, 560, "6,38,90,786"), _w(630, 120, 760, "9,28,45,936")],
+        # Nil this year, a real figure last year - the row carries no
+        # current-period amount at all, so it is a heading for FY2026 and a
+        # LINE ITEM for FY2025.
+        [_w(10, 140, 200, "(b) Deferred tax"), _w(545, 140, 560, "-"),
+         _w(650, 140, 760, "(13,69,133)")],
+        [_w(10, 160, 200, "Total tax expenses"), _w(545, 160, 560, "-"),
+         _w(650, 160, 760, "(13,69,133)")],
+    ]]
+
+
+def test_comparative_column_is_harvested_line_by_line():
+    sides = F._harvest_vertical(_two_period_rows())
+    comp = sides.get("comparative_sections")
+    assert comp, "no comparative sections harvested"
+    items = {l: a for s in comp for l, a in s["items"]}
+    assert items.get("I. Revenue from operations") == 95243661
+    assert items.get("II. Other income") == 50856
+    assert items.get("(e) Employee benefits expenses") == 4435992
+    assert [s["total"] for s in comp] == [95294517, 92845936, -1369133]
+    assert items.get("(b) Deferred tax") == -1369133
+
+
+def test_comparative_statement_is_emitted_for_the_prior_year():
+    rows = _two_period_rows()
+    title = rows_with_cells(
+        [_w(10, -20, 400, "Statement of Profit and Loss for the year ended 31.03.2026")], 900)[0]
+    blocks = F.find_blocks([[title] + rows])
+    years = {(b["year"], b.get("from_comparative", False)) for b in blocks}
+    assert (2026, False) in years
+    assert (2025, True) in years
+    prior = next(b for b in blocks if b.get("from_comparative"))
+    assert F.status_of(F.check_block(prior)) == F.VERIFIED
+
+
+# ── The entity is the business, not its address ──────────────────
+#    Borrower D' statements head:
+#        Borrower D
+#        (CIN: U35120MH2008PTC182130 )
+#        6-A, H & G House, Sector 11, C B D Belapur, Navi Mumbai, ... 400614
+#        Provisional Balance Sheet as at 31st March, 2026
+#    _ADDRESS_RE knew "road/nagar/marg/building" but not "House"/"Sector",
+#    so the address line was taken for the business and the workbook titled
+#    itself after it. An address is recognised by SHAPE - a PIN code, or
+#    several comma-separated parts - not only by its keywords.
+
+_sample_d_HEAD = [
+    "Borrower D",
+    "(CIN: U35120MH2008PTC182130 )",
+    "6-A, H & G House, Sector 11, C B D Belapur, Navi Mumbai, Maharashtra, India, 400614",
+    "Provisional Balance Sheet as at 31st March, 2026",
+]
+
+
+def test_entity_is_the_business_not_the_address():
+    assert F._find_entity(_sample_d_HEAD, 3) == "Borrower D"
+
+
+def test_address_shapes_are_recognised():
+    for addr in (
+        "6-A, H & G House, Sector 11, C B D Belapur, Navi Mumbai, Maharashtra, India, 400614",
+        "Shop No 4, Sample Address, Wakad, Pune 411057",
+        "Plot 12, MIDC Industrial Area, Nashik",
+    ):
+        assert F._looks_like_address(addr), addr
+
+
+def test_a_business_name_is_not_mistaken_for_an_address():
+    """These are real borrowers' names - two carry address WORDS."""
+    for name in ("Borrower A", "M/S. Borrower E",
+                 "Borrower D", "Borrower I",
+                 "Borrower M"):
+        assert not F._looks_like_address(name), name
+
+
+# ── A statement continued on the next page ───────────────────────
+#    Tally prints a long Balance Sheet across pages, bridged by its own
+#    running subtotal (A CUSTOMER FY2026):
+#        page 3   ... Carried Over 14,98,54,659.78 | Carried Over 6,06,57,088.80
+#        page 4   Brought Forward 14,98,54,659.78 | Brought Forward 6,06,57,088.80
+#                 Current Assets ... Sundry Debtors 8,35,17,640.61 ...
+#                 Total 14,98,54,659.78 | Total 14,98,54,659.78
+#    Read a page at a time, the first half could never balance (its assets
+#    continue overleaf) and the second half looked like a second statement
+#    whose two "Brought Forward" lines - Rs 21.05 crore - fitted no row.
+#    Neither is an OCR fault, so Vision cannot fix it either.
+
+def _continued_pages():
+    page3 = [rows_with_cells(r, 900)[0] for r in [
+        [_w(10, 0, 200, "A CUSTOMER")],
+        [_w(10, 20, 200, "Balance Sheet")],
+        [_w(10, 40, 200, "1-Apr-25 to 31-Mar-26")],
+        [_w(10, 60, 150, "Liabilities"), _w(300, 60, 420, "as at 31-Mar-26"),
+         _w(500, 60, 600, "Assets"), _w(700, 60, 820, "as at 31-Mar-26")],
+        [_w(10, 80, 200, "Capital Account"), _w(300, 80, 420, "4,90,42,016.76"),
+         _w(500, 80, 650, "Fixed Assets"), _w(700, 80, 820, "2,17,97,750.80")],
+        [_w(10, 100, 200, "Sundry Creditors"), _w(300, 100, 420, "10,08,12,643.02"),
+         _w(500, 100, 650, "Investments"), _w(700, 100, 820, "3,88,59,338.00")],
+        [_w(10, 120, 200, "Carried Over"), _w(300, 120, 420, "14,98,54,659.78"),
+         _w(500, 120, 650, "Carried Over"), _w(700, 120, 820, "6,06,57,088.80")],
+        [_w(10, 140, 200, "continued ...")],
+    ]]
+    page4 = [rows_with_cells(r, 900)[0] for r in [
+        [_w(10, 0, 200, "A CUSTOMER")],
+        [_w(10, 20, 300, "Balance Sheet : 1-Apr-25 to 31-Mar-26")],
+        [_w(10, 40, 150, "Liabilities"), _w(300, 40, 420, "as at 31-Mar-26"),
+         _w(500, 40, 600, "Assets"), _w(700, 40, 820, "as at 31-Mar-26")],
+        [_w(10, 60, 200, "Brought Forward"), _w(300, 60, 420, "14,98,54,659.78"),
+         _w(500, 60, 650, "Brought Forward"), _w(700, 60, 820, "6,06,57,088.80")],
+        [_w(500, 80, 650, "Sundry Debtors"), _w(700, 80, 820, "8,35,17,640.61")],
+        [_w(500, 100, 650, "Cash-in-hand"), _w(700, 100, 820, "56,79,930.37")],
+        [_w(10, 120, 200, "Total"), _w(300, 120, 420, "14,98,54,659.78"),
+         _w(500, 120, 650, "Total"), _w(700, 120, 820, "14,98,54,659.78")],
+    ]]
+    return [page3, page4]
+
+
+def test_statement_continued_on_the_next_page_is_one_statement():
+    blocks = F.find_blocks(_continued_pages())
+    assert len(blocks) == 1, [b["kind"] for b in blocks]
+    b = blocks[0]
+    b["check"] = F.check_block(b)
+    assert F.status_of(b["check"]) == F.VERIFIED, b["check"]["reason"]
+    labels = [re.sub(r"^\[[A-Z]+\]\s*", "", l) for l, _a in F.all_items(b["sides"])]
+    assert "Sundry Debtors" in labels          # the overleaf half is in
+    assert not any("arried" in l or "rought" in l for l in labels)  # bridges are not items
+    assert b["printed_total"] == 149854660
+
+
+def test_pages_are_only_joined_across_a_real_bridge():
+    """Two statements that merely follow one another stay separate. A join
+    needs evidence of a break: a Carried Over / Brought Forward pair, or
+    "continued ..." with the heading reprinted overleaf. With neither, these
+    are two statements."""
+    pages = _continued_pages()
+    pages[0] = [r for r in pages[0]
+                if not {"Carried Over", "continued ..."}
+                & {" ".join(c[2] for c in r[1]).strip()}
+                and "Carried Over" not in " ".join(c[2] for c in r[1])]
+    assert len(F.find_blocks(pages)) == 2
+
+
+def _continued_pl_pages():
+    """Tally's P&L runs onto the next page with no Carried Over row at all -
+    just "continued ..." at the foot, and the real Total overleaf."""
+    page1 = [rows_with_cells(r, 900)[0] for r in [
+        [_w(10, 0, 200, "A CUSTOMER")],
+        [_w(10, 20, 200, "Profit & Loss A/c")],
+        [_w(10, 40, 220, "1-Apr-25 to 31-Mar-26")],
+        [_w(10, 60, 150, "Particulars"), _w(300, 60, 420, "1-Apr-25 to 31-Mar-26"),
+         _w(500, 60, 640, "Particulars"), _w(700, 60, 820, "1-Apr-25 to 31-Mar-26")],
+        [_w(10, 80, 200, "Purchase Accounts"), _w(300, 80, 420, "8,44,58,255.00"),
+         _w(500, 80, 650, "Sales Accounts"), _w(700, 80, 820, "18,50,17,094.19")],
+        [_w(10, 100, 200, "Direct Expenses"), _w(300, 100, 420, "7,04,27,032.60")],
+        [_w(10, 120, 200, "Gross Profit c/o"), _w(300, 120, 420, "3,01,31,806.59")],
+        [_w(300, 140, 420, "18,50,17,094.19"), _w(700, 140, 820, "18,50,17,094.19")],
+        [_w(10, 160, 200, "Indirect Expenses"), _w(300, 160, 420, "1,24,57,002.67"),
+         _w(500, 160, 650, "Gross Profit b/f"), _w(700, 160, 820, "3,01,31,806.59")],
+        [_w(10, 180, 200, "Employee Benifit Expenses"), _w(300, 180, 420, "86,97,964.75"),
+         _w(500, 180, 650, "Indirect Incomes"), _w(700, 180, 820, "276.00")],
+        [_w(10, 200, 200, "Nett Profit"), _w(300, 200, 420, "1,76,75,079.92")],
+        [_w(10, 220, 200, "continued ...")],
+    ]]
+    page2 = [rows_with_cells(r, 900)[0] for r in [
+        [_w(10, 0, 200, "A CUSTOMER")],
+        [_w(10, 20, 330, "Profit & Loss A/c: 1-Apr-25 to 31-Mar-26")],
+        [_w(10, 40, 150, "Particulars"), _w(300, 40, 420, "1-Apr-25 to 31-Mar-26"),
+         _w(500, 40, 640, "Particulars"), _w(700, 40, 820, "1-Apr-25 to 31-Mar-26")],
+        [_w(10, 60, 200, "Total"), _w(300, 60, 420, "3,01,32,082.59"),
+         _w(500, 60, 650, "Total"), _w(700, 60, 820, "3,01,32,082.59")],
+    ]]
+    return [page1, page2]
+
+
+def test_continued_page_without_a_carried_over_row_still_joins():
+    """"continued ..." at the foot, the same statement's heading repeated
+    overleaf: one statement. Read apart, A CUSTOMER' whole Indirect
+    Expenses block (Rs 1.24 crore, including Rs 86.98 lakh of employee cost)
+    was lost and the year's profit read Rs 292.50 lakh against a printed
+    Rs 176.75 lakh."""
+    blocks = F.find_blocks(_continued_pl_pages())
+    assert len(blocks) == 1, [b["title"] for b in blocks]
+    labels = [re.sub(r"^\[[A-Z]+\]\s*", "", l) for l, _a in F.all_items(blocks[0]["sides"])]
+    assert "Employee Benifit Expenses" in labels
+
+
+# ── The section tag outranks the wording ─────────────────────────
+#    A line already placed by its statement - [EQ] on the capital side of a
+#    balance sheet, [EXP] on the debit side of a P&L - must not be pulled
+#    into the other statement by its words alone. Both happened on one real
+#    filing (A CUSTOMER FY2026):
+#      "[EQ] Interest Paid On Housing Loan"  a movement INSIDE the capital
+#          account, read as the P&L's interest: equity short Rs 8.82 lakh and
+#          the year's profit reduced by the same.
+#      "[EXP] Sales & Commission"  an expense, read as SALES: income
+#          overstated Rs 1.45 lakh and the expense lost, Rs 2.90 lakh of
+#          phantom profit.
+#    Together they put profit Rs 5.92 lakh below the printed Rs 176.75 lakh.
+
+def test_a_balance_sheet_line_is_not_pulled_into_the_pl():
+    from engine.mapping import taxonomy as T
+    assert T.map_label("[EQ] Interest Paid On Housing Loan", {}) == "equity_capital"
+    assert T.map_label("[EQ] Lic of India", {}) == "equity_capital"
+    assert T.map_label("[CL] Provision for tax", {}) == "current_liabilities"
+
+
+def test_an_expense_is_never_income_and_income_never_an_expense():
+    from engine.mapping import taxonomy as T
+    assert T.map_label("[EXP] Sales & Commission", {}) == "other_expenses"
+    assert T.map_label("[EXP] Sales Promotion Expenses", {}) == "other_expenses"
+    assert T.map_label("[INC] Transport Movement Charges", {}) == "sales_other_income"
+
+
+def test_the_guard_leaves_ordinary_lines_alone():
+    from engine.mapping import taxonomy as T
+    assert T.map_label("[EXP] Interest on loan", {}) == "interest_finance"
+    assert T.map_label("[EXP] Diesel & Fuel Expenses", {}) == "transport_admin"
+    assert T.map_label("[EXP] Employee Benifit Expenses", {}) == "employee_costs"
+    assert T.map_label("[INC] Sales Accounts", {}) == "sales_other_income"
+    assert T.map_label("[FA] Motor Vehicle", {}) == "fixed_assets"
+
+
+def _t_account(left_rows, right_rows):
+    """A two-sided Balance Sheet page: liabilities left, assets right."""
+    rows = [[_w(10, 0, 160, "Liabilities"), _w(300, 0, 420, "as at 31-Mar-26"),
+             _w(500, 0, 640, "Assets"), _w(700, 0, 820, "as at 31-Mar-26")]]
+    for i, (l, r) in enumerate(zip(left_rows, right_rows), start=1):
+        row = []
+        if l:
+            row.append(_w(10, i * 20, 200, l[0]))
+            if l[1]:
+                row.append(_w(300, i * 20, 420, l[1]))
+        if r:
+            row.append(_w(500, i * 20, 650, r[0]))
+            if r[1]:
+                row.append(_w(700, i * 20, 820, r[1]))
+        rows.append(row)
+    return [rows_with_cells(r, 900)[0] for r in rows]
+
+
+def test_tally_profit_and_loss_group_is_equity_on_the_liabilities_side():
+    """
+    Tally's liabilities side runs Capital Account, Loans, Current
+    Liabilities, Profit & Loss A/c. The last is retained profit; with no tag
+    it inherited the Current Liabilities context above it, and Rs 1.76 crore
+    of profit was spread as a current liability (A CUSTOMER FY2026).
+    The Balance Sheet still balanced - only the tag catches it.
+    """
+    sides = F._harvest(_t_account(
+        [("Capital Account", "4,90,42,016.76"), ("Cap.of a lender", "4,90,42,016.76"),
+         ("Current Liabilities", "6,72,91,201.63"), ("Sundry Creditors", "6,72,91,201.63"),
+         ("Profit & Loss A/c", "1,76,75,079.92"), ("Current Period", "1,76,75,079.92")],
+        [("Fixed Assets", "2,17,97,750.80"), ("Akola Land", "2,17,97,750.80"),
+         (None, None), (None, None), (None, None), (None, None)])[1:],
+        900, None, None)
+    tags = {l: l.split("]")[0] + "]" for l, _a in sides["left"] if l.startswith("[")}
+    profit = [t for l, t in tags.items() if "Current Period" in l]
+    assert profit == ["[EQ]"], tags
+
+
+def test_profit_and_loss_on_the_assets_side_is_not_equity():
+    """The same group name, printed among the ASSETS, is an accumulated LOSS
+    carried as an asset - Borrower A FY2024 (Rs 310.29 lakh),
+    which its analyst's sheet keeps in current assets. Read as equity it
+    moved Rs 310.29 lakh from the asset side to the liability side and put
+    both totals out by that amount."""
+    sides = F._harvest(_t_account(
+        [("Capital Account", "36,59,100.00"), (None, None), (None, None)],
+        [("FIXED ASSETS", "1,00,00,000.00"), ("PROFIT & LOSS", "3,10,29,400.00"),
+         ("CASH-IN-HAND", "1,25,000.00")])[1:],
+        900, None, None)
+    right = dict((l, a) for l, a in sides["right"])
+    pl = [l for l in right if "PROFIT" in l.upper()]
+    assert pl and not any(l.startswith("[EQ]") for l in pl), right
+
+
+# ── A statement's year, when its heading will not say ────────────
+#    A CUSTOMER AY2025-26: "Profit & Loss A/c as on 31st, March , 2025"
+#    - a comma after "31st" defeated the period pattern, so the P&L had no
+#    year. Its comparative column is only emitted as the prior year's
+#    statement when the year is known, so FY2024's P&L - printed in full,
+#    line by line - never reached the sheet, while the Balance Sheet on the
+#    next page (dated cleanly) produced its FY2024 column. The column headers
+#    ("2025 | 2024") said both years all along.
+
+def test_heading_date_with_stray_punctuation_is_read():
+    for line, year in [
+            ("Profit & Loss A/c as on 31st, March , 2025", 2025),
+            ("Balance Sheet as at 31st March, 2025", 2025),
+            ("Balance Sheet as on 31 st , March 2026", 2026),
+            ("PROFIT AND LOSS ACCOUNT FOR THE YEAR ENDED 31.03.26", 2026)]:
+        assert F._find_period([line], 0)[0] == year, line
+
+
+def _undated_two_period_pl():
+    return [
+        rows_with_cells([_w(10, -40, 300, "Profit & Loss Account")], 900)[0],
+        rows_with_cells([_w(10, -20, 150, "Particulars"), _w(300, -20, 340, "Note"),
+                         _w(480, -20, 520, "2025"), _w(700, -20, 740, "2024")], 900)[0],
+    ] + _two_period_rows()[1:]
+
+
+def test_year_falls_back_to_the_statements_own_column_headers():
+    """A heading with no date at all: the column headers still name both
+    periods, and the prior one becomes its own statement."""
+    blocks = F.find_blocks([_undated_two_period_pl()])
+    years = sorted((b["year"], b.get("from_comparative", False)) for b in blocks)
+    assert years == [(2024, True), (2025, False)], years
+
+
+def test_a_period_range_names_the_year_it_ends_in():
+    """
+    Tally heads its statements with the period as a RANGE:
+    "1-Apr-2023 to 31-Mar-2024". That is one period, ending in 2024. The
+    column-header fallback first read the range's start year, dating
+    Borrower L's FY2024 statements 2023 and his FY2025 ones 2024 - a
+    borrower that had matched the analyst's sheet in full then diverged on
+    69 rows. Separate cells are still separate columns.
+    """
+    def rows(*cells_per_row):
+        return [rows_with_cells([_w(x0, i * 20, x0 + 150, t) for x0, t in r], 900)[0]
+                for i, r in enumerate(cells_per_row)]
+    assert F._header_years(rows([(10, "1-Apr-2023 to 31-Mar-2024")])) == [2024]
+    assert F._header_years(rows([(10, "1-Apr-25 to 31-Mar-26")])) == [2026]
+    assert F._header_years(rows([(400, "2025"), (650, "2024")])) == [2025, 2024]
+    assert F._header_years(rows([(400, "As at 31st March, 2025"),
+                                 (650, "As at 31st March, 2024")])) == [2025, 2024]

@@ -58,7 +58,14 @@ _IGNORE_RE = re.compile(
     # Statements introduce their movement lines with "Add:" / "Less:"
     # ("Add: Profit/(Loss) for the year"), which must not hide the subtotal.
     r"(?:add\s*:?\s*|less\s*:?\s*)?"
-    r"(?:total\b|gross\s+total\b|profit\s+(?:before|after|for\s+the|available)"
+    # "Total" glued to the next word by OCR ("TotalAssets") is still a total.
+    # "total outstanding dues of micro ... / of creditors other than micro
+    # and small enterprises" is Schedule III's spelling of TRADE PAYABLES -
+    # a line item that merely opens with "total". Set aside here as a
+    # subtotal, Rs 432.25 lakh of creditors never reached the sheet and
+    # Total of Liabilities came up short by exactly that amount
+    # (Borrower D FY2025). A real "Total ..." row is still ignored.
+    r"(?:total(?!\s+outstanding\s+dues)(?:\b|(?=[A-Z]))|gross\s+total\b|profit\s+(?:before|after|for\s+the|available)"
     r"|(?:nett?\s+)?profit\s*/?\s*\(?loss\)?\b|loss\s+for\s+the"
     # A T-account P&L closes with the period's result on whichever side
     # balances it: "Net Loss", "Net Profit c/f", "Loss transferred to Capital".
@@ -75,7 +82,7 @@ _IGNORE_RE = re.compile(
     # (Borrower B, both years) went unrecognised, was counted as an
     # EXPENSE, and turned a Rs 10.70 lakh profit into a Rs 31.17 lakh loss.
     r"|gross\s+(?:pr\w{1,4}t|loss)\b"
-    r"|earnings?\s+per|\bE\.?P\.?S\.?\b|basic\s*\(|diluted"
+    r"|earnings?\s+per|\bE\.?P\.?S\.?\b|basic\s*\(|basic\s*(?:&|and)\s*diluted|diluted"
     r"|carried\s+(?:to|forward)|balance\s+(?:c/?f|b/?f)"
     r"|as\s+per\s+last\s+balance\s+sheet)", re.I)
 
@@ -230,6 +237,37 @@ def save_learned(mapping: dict) -> None:
 # MAPPING
 # ─────────────────────────────────────────────────────────────────
 
+# A line's SECTION TAG outranks its wording.
+#
+# The harvester tags each line with the part of the statement it was printed
+# in: [EQ]/[CL]/[FA]/... on a balance sheet, [EXP]/[INC] on the two sides of
+# a P&L. That placement is structural evidence - where the accountant put the
+# figure - while a synonym is only a guess from words. Where they disagree,
+# the tag wins: a movement inside the capital account is not the P&L's
+# interest just because it says "Interest Paid On Housing Loan", and a debit
+# line is not revenue just because it says "Sales & Commission". Both are
+# real (A CUSTOMER FY2026), and together they moved profit Rs 5.92
+# lakh away from the printed figure.
+_BS_TOKENS = {"EQ", "LIAB", "CL", "NCL", "CA", "NCA", "FA", "INV", "SL", "UL"}
+_TOKEN_RE = re.compile(r"^\s*\[([A-Z]{2,4})\]")
+_PL_TARGETS = frozenset(PL_INCOME + PL_EXPENSE + PL_TAX)
+
+
+def _blocked_targets(label: str) -> frozenset:
+    """Buckets this line's own section forbids."""
+    m = _TOKEN_RE.match(label or "")
+    if not m:
+        return frozenset()
+    token = m.group(1)
+    if token in _BS_TOKENS:
+        return _PL_TARGETS                      # a balance-sheet line
+    if token == "EXP":
+        return frozenset(PL_INCOME)             # a debit line is never income
+    if token == "INC":
+        return frozenset(PL_EXPENSE)            # a credit line is never a cost
+    return frozenset()
+
+
 def map_label(label: str, learned: dict = None):
     """
     One label → a template key, IGNORE for a derived/subtotal row, or None when
@@ -246,8 +284,9 @@ def map_label(label: str, learned: dict = None):
     key = _norm(label)
     if learned and key in learned:
         return learned[key]
+    blocked = _blocked_targets(label)
     for target, rx in _COMPILED:
-        if rx.search(label):
+        if target not in blocked and rx.search(label):
             return target
     return None
 
@@ -296,8 +335,7 @@ key from the list above. Rules:
 _CATALOGUE = {
     "sales_other_income":          "revenue, sales, turnover, gross receipts, other income",
     "purchases":                   "purchases, raw material, cost of material, stock movements",
-    "transport_admin":             "transport/vehicle running: diesel, freight, toll, tyres, RTO tax, repairs, insurance",
-    "electricity":                 "electricity, power and fuel",
+    "transport_admin":             "transport/vehicle running: diesel, freight, toll, tyres, RTO tax, repairs, insurance, electricity/power",
     "employee_costs":              "salaries, wages, staff welfare, bonus, gratuity, PF",
     "other_expenses":              "any other operating or administrative expense",
     "interest_finance":            "interest paid, bank charges, finance costs",

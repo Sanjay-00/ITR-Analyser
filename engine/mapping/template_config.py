@@ -22,7 +22,8 @@ The sheet is the COMBINED MASTER format (agreed with the user 2026-09-12):
 the union of the analysts' two reference layouts, "Format.xlsx" and
 "Validation Format- check.xlsx". Every row either has - all eight expense
 rows, separate Sundry Creditors and Debtors / Receivables rows, Debtor and
-Creditor Days, and the DSCR Calculation block - so the output is always the
+Creditor Days, and a closing year-on-year growth block - so the output is
+always the
 same shape, with 0 in any row a borrower's accounts do not use. Tax is
 entered POSITIVE and subtracted (PAT = PBT - tax - deferred tax), as in
 "Validation Format- check" and the analysts' filled sheets. Totals, ratios,
@@ -42,7 +43,7 @@ import re
 
 PL_INCOME = ["sales_other_income"]
 PL_EXPENSE = [
-    "purchases", "transport_admin", "electricity", "employee_costs",
+    "purchases", "transport_admin", "employee_costs",
     "other_expenses", "interest_finance", "depreciation", "extraordinary",
 ]
 PL_TAX = ["provision_tax", "provision_deferred_tax", "preference_dividend"]
@@ -76,7 +77,6 @@ LABELS = {
     "gross_receipts":              "Gross Receipts",
     "purchases":                   "Purchases & Raw Material",
     "transport_admin":             "Transport operation and admin charges",
-    "electricity":                 "Electricity",
     "employee_costs":              "Employee Costs",
     "other_expenses":              "Other Expenses",
     "interest_finance":            "Interest and Finance Expenses",
@@ -134,7 +134,6 @@ ROWS = [
     ("section", "",                            "Expenses"),
     ("item",  "purchases",                     None),
     ("item",  "transport_admin",               None),
-    ("item",  "electricity",                   None),
     ("item",  "employee_costs",                None),
     ("item",  "other_expenses",                None),
     ("item",  "interest_finance",              None),
@@ -260,10 +259,23 @@ SNAP_RATIO_NAMES = [
     ("Creditor Days",                           "Creditor Days"),
 ]
 
-# DSCR Calculation: the analyst keys the EMIs; everything else is linked.
-# "Yearly Obligation (B)" multiplies the proposed EMI by 4 in an audited
-# column and by 1 in a provisional one, as in "Format.xlsx".
-DSCR_PROPOSED_MULTIPLIER = {"Audited": 4, "Provisional": 1}
+# Year-on-year growth, closing the sheet (agreed 2026-09-16, matching the
+# analyst's own "ITR - Borrower D" workbook). Live formulas off the rows
+# above - (this year - last year) / |last year| - so a corrected figure
+# recomputes its own growth. The first column has no prior year and shows "-".
+#
+# The DSCR Calculation block that used to sit between the ratios and the
+# Financial Snap is gone with it: its EMI rows are keyed by hand from a loan
+# schedule, not read from any ITR, and the DSCR ratio itself stays in RATIOS.
+GROWTH = [
+    ("Sales and other Income", "sales_other_income"),
+    ("Gross Expenses",         "gross_expenses"),
+    ("Profit before tax",      "profit_before_tax"),
+    ("Profit after tax",       "profit_after_tax"),
+    ("Cash Profit",            "cash_profit"),
+    ("Total of Assets",        "total_assets"),
+    ("Total of Liabilities",   "total_liabilities"),
+]
 
 # ─────────────────────────────────────────────────────────────────
 # SYNONYMS
@@ -297,7 +309,11 @@ SYNONYMS = [
     # "Deferred Tax Liabilities (Net)" gets its own row - confirmed against
     # the analyst's own Borrower K template (2026-07-29), not folded into Other Long
     # Term Liabilities.
-    ("deferred_tax_liability",      r"deferred\s+tax\s+liabilit"),
+    # "liab", not "liabilit": a real statement printed "Deferred Tax
+    # Liabilty (Net)" (Borrower H FY2023) - the full-word rule missed it and the
+    # Balance Sheet's Rs 1.05 crore liability fell through to the P&L's
+    # deferred-tax EXPENSE rule below.
+    ("deferred_tax_liability",      r"deferred\s+tax\s+liab"),
     # Analyst convention: an income-tax asset is bucketed with deferred tax
     # assets rather than getting a row of its own.
     ("deferred_tax_assets",         r"deferred\s+tax\s+asset|income[\s-]*tax\s+asset"),
@@ -484,11 +500,19 @@ SYNONYMS = [
                                     r"(?:bank\s*)?charge|bank\s+(?:int|charge)|"
                                     r"\binterest\b(?!\s+(?:income|received|on\s+(?:IT|"
                                     r"income[\s-]*tax)))"),
+    # "ESIC Paid" / "PF Paid" are the employer's statutory contributions -
+    # employee cost (Borrower E' sheet). A liability ("PF Payable")
+    # is not an expense.
     ("employee_costs",              r"employee|salar(?:y|ies)|wages|staff|bonus|"
-                                    r"pagar|labour|gratuity|provident"),
-    # "Light Bill" is the everyday small-business name for the electricity
-    # bill - the analyst's own Borrower B sheet files it here.
-    ("electricity",                 r"electricity|power\s*(?:&|and)?\s*fuel|"
+                                    r"pagar|labour|gratuity|provident|"
+                                    r"\b(?:esic|e\.s\.i\.c\.?|esi|pf)\b"
+                                    r"(?!.*\b(?:payable|dues?|outstanding)\b)"),
+    # Electricity has no row of its own (removed 2026-09-16, by decision):
+    # the power bill is spread as an operating cost instead. "Light Bill" is
+    # the everyday small-business name for it; MSEB/MSEDCL are the
+    # Maharashtra utilities. Kept as its own rule, ahead of transport_admin's,
+    # so the wording is claimed explicitly rather than by "fuel" further down.
+    ("transport_admin",             r"electricity|power\s*(?:&|and)?\s*fuel|"
                                     r"light\s+bill|\bmseb\b|\bmsedcl\b"),
     ("purchases",                   r"purchase|cost\s+of\s+material|raw\s+material|"
                                     r"changes?\s+in\s+inventor|stock[\s-]*in[\s-]*trade"),
@@ -497,14 +521,22 @@ SYNONYMS = [
     # operation and admin charges rather than lumping into Other Expenses.
     ("transport_admin",             r"direct\s+expense|operating\s+(?:expense|cost)|"
                                     r"cost\s+of\s+(?:services|operations)|"
-                                    r"transport|freight|diesel|fuel|toll|tyre|"
+                                    # "Disel": a real schedule's own spelling.
+                                    r"transport|freight|die?sel|fuel|toll|tyre|"
                                     r"tanker|"
                                     r"\br\.?t\.?o\.?\b|road\s+tax|"
                                     r"stores?\s*(?:&|and)?\s*spares?|hamali|"
                                     r"vehicle\s+(?:running|expense)|"
-                                    r"repair\s*(?:&|and)?\s*maint|insurance"),
+                                    r"repairs?\s*(?:&|and)?\s*maint|insurance"),
     ("extraordinary",               r"extra\s*[\s-]*ordinary|exceptional\s+item"),
     ("provision_deferred_tax",      r"deferred\s+tax(?:\s+expense)?\b"),
+    # MAT credit on the P&L is part of the year's tax charge - the analyst's
+    # own Borrower H FY2023 sheet spreads its Rs 32.19 lakh here, and the printed
+    # profit only reconciles with it deducted (1,84,98,578 - 31,08,354 -
+    # 32,19,297 = 1,21,70,927). Never a Balance Sheet asset line ("MAT Credit
+    # Entitlement" under an asset section).
+    ("provision_deferred_tax",      r"^(?!\[(?:NCA|CA|FA|INV)\]).*\bMAT\s+credit\b"
+                                    r"(?!\s+entitlement)"),
     ("provision_tax",               r"\b(?:current\s+tax|provision\s+for\s+tax|"
                                     r"income[\s-]*tax\s+(?:expense|provision)|tax\s+expense)\b"),
     ("preference_dividend",         r"preference\s+dividend"),
