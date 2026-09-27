@@ -1248,3 +1248,62 @@ full match; Borrower E 7, Borrower A full match, J K 8, Borrower K 1, Borrower J
 22 - all unchanged. **Also corrected:** YTM (case 33) is now dated FY2026, the
 year its "1-Apr-25 to 31-Mar-26" statements actually end in - it had been
 shown as FY2025.
+
+
+### 38. Consistency checks, stage 1 — ADDED 2026-09-17
+
+Every P&L and Balance Sheet row now carries a trust level - proven,
+consistent, doubtful or unread (`engine/checks.py`). A statement that misses
+its own section total by at most 0.5% is KEPT, only that section's lines
+doubtful, instead of being dropped whole (`financials.salvageable`): one
+unreadable Rs 63 line used to cost sample_d FY2025 every P&L row.
+
+Six independent checks run after every year is assembled - section totals;
+the sheet balancing AFTER mapping; profit against the statement's own profit
+line; profit against the ITR computation; the profit a capital account
+credits (an Income & Expenditure account calls it a surplus); and a year
+printed twice. A check lacking its inputs SKIPS, and a failing check disputes
+only rows that were not already proven.
+
+**A year printed twice** ("ITR 2025-26" prints FY2025 beside FY2026; "ITR
+2024-25" prints FY2025 itself) is kept as that year's `alternate`. The two
+printings are compared, and a field one of them lost is taken from the other -
+never over a proven reading, only from a proven row, only when both agree on
+their grand totals, and only when the fill CLOSES the gap on the total that
+row feeds. That last rule came from the golden gate: Borrower E FY2024's own
+balance sheet is a summary whose "Current Assets" already holds the debtors,
+while the comparative column breaks them out, and filling Debtors counted Rs
+1.89 crore twice (7 -> 18 rows). A statement too broken to salvage now takes
+the other printing whole, instead of reading "Check ITR".
+
+Doubtful INPUT rows are amber in the workbook with a note naming the check and
+the gap; a filled row carries its evidence (file and page). Totals, the
+Financial Snap, the ratios and the growth block are formulas over those rows
+and are never marked or counted twice. The Audit Trail lists every check; the
+app lists the failing ones per year.
+
+**Golden gate:** Borrower F 27, Borrower E 7, Borrower K 1, Borrower L pass, Borrower G 22, J K 8,
+Borrower A pass, Borrower M 25, Borrower J 14 - all unchanged; **Borrower H 28 -> 11**.
+sample_d (audited + provisional), YTM and YES AY2025-26 read exactly as before.
+
+### 39. A damaged heading dated a statement a year early — FIXED 2026-09-17
+
+Borrower F FY2025: the scan damaged the heading's year ("Balance Sheet as
+at 31st March,?025"), so the column headers decided the year - and OCR had
+fused both into ONE cell, "31st March 2025 31st March 2024". The fallback
+sorted those by value and took 2024: the FY2025 balance sheet was dated
+FY2024, added to FY2024's own (13.43 + 21.84 crore, both years wrong), and
+FY2025 had no balance sheet at all. Golden 27 -> 58 rows.
+
+Three guards, all general:
+- a statement's own year is the LATEST year its columns name (a current
+  period is never older than its comparative), whatever the print order or
+  fusing - this also covers previous-year-first layouts (Borrower E, Borrower K);
+- years within one cell keep their printed order;
+- only plausible statement years (20xx) from the rows directly under the
+  heading. An audit-report sentence mistaken for a heading ("... as at the
+  balance sheet date.") had picked "1948" out of its prose and grown an
+  FY1948 column in the workbook.
+
+Borrower F is back to 27 rows and reads 2,184.30 lakh for FY2025 and 1,342.86 for
+FY2024, both equal to the printed totals.

@@ -27,7 +27,8 @@ import os
 import re
 
 from .extract import financials as F
-from .extract.itr_parser import extract_identity, extract_book_profit
+from .extract.borrowings import GENERIC_LT_BORROWINGS, owner_loan_lines, owners_loan_note
+from .extract.itr_parser import extract_identity, extract_book_profit, extract_return_figures
 from .ingest import relevance
 from .mapping import taxonomy
 
@@ -474,6 +475,7 @@ def _read_document(source, extract_fn, api_key: str = None,
 
     identity = extract_identity(text)
     book_profit, book_profit_page = extract_book_profit(page_texts)
+    return_figures = extract_return_figures(page_texts)
     pages    = relevance.select(page_texts)
 
     def _find_and_check(only_pages):
@@ -555,11 +557,15 @@ def _read_document(source, extract_fn, api_key: str = None,
         "scanned":          scanned,
         "book_profit":      book_profit,
         "book_profit_page": book_profit_page,
+        "return_figures":   return_figures,
         "pages_total":      len(page_texts),
         "pages_used":       len(pages),
         "page_summary":     relevance.summary(page_texts),
         "blocks":           blocks,
         "vision_pages":     vision_pages,
+        # Note lines naming unsecured loans from the owners (extract/
+        # borrowings.py): what a generic "Long Term Borrowings" line is.
+        "owner_loan_lines": owner_loan_lines(page_texts),
         # The year this FILE is about, for statements that print no period
         # of their own and for the computation sheet's restated profit.
         "year":             _fy_end_year(candidates, identity),
@@ -636,6 +642,25 @@ def _assemble(year, blocks: list, docs: list, api_key: str = None,
             "file": src,
             "trust": level})
 
+    # A generic "Long Term Borrowings" face line is mapped to secured loans by
+    # default. When a note in the same filing says that amount is unsecured
+    # loans from the directors, promoters or relatives, it is quasi equity,
+    # and is moved to unsecured loans, with the note cited.
+    owner_note = None
+    generic = [src for src in sources.get("secured_loan_asset_financed", [])
+               if GENERIC_LT_BORROWINGS.match(src["label"] or "")]
+    if generic:
+        amount = sum(src["amount"] for src in generic)
+        lines = [line for d in docs for line in d.get("owner_loan_lines") or []]
+        owner_note = owners_loan_note(lines, amount)
+        if owner_note is not None:
+            buckets["secured_loan_asset_financed"] = buckets.get("secured_loan_asset_financed", 0) - amount
+            buckets["unsecured_loans"] = buckets.get("unsecured_loans", 0) + amount
+            sources["secured_loan_asset_financed"] = [x for x in sources["secured_loan_asset_financed"] if x not in generic]
+            if not sources["secured_loan_asset_financed"]:
+                del sources["secured_loan_asset_financed"]
+            sources.setdefault("unsecured_loans", []).extend(generic)
+
     # A statement we could not read must not render as a column of zeros. If
     # the P&L failed and the balance sheet passed, the P&L rows are UNKNOWN
     # ("Check ITR"), not nil - the difference between "this business earned
@@ -645,6 +670,33 @@ def _assemble(year, blocks: list, docs: list, api_key: str = None,
                               have_pl=F.PROFIT_LOSS in have,
                               have_bs=F.BALANCE_SHEET in have)
 
+    # The tax lines of a Schedule III P&L sit under a "Tax expense" heading
+    # that OCR can separate from them, leaving an untagged "Current Year" no
+    # rule claims (a real filing: Rs 21.11 lakh of tax lost, profit after tax
+    # read as profit before tax). In a P&L that reconciled, such a trailing
+    # line named current or deferred tax, smaller than the profit, is the tax.
+    tax_note = None
+    if F.PROFIT_LOSS in have and not buckets.get("provision_tax") and not buckets.get("provision_deferred_tax"):
+        found = _untagged_tax_lines(usable, values.get("profit_before_tax"))
+        for key, label, amount, page in found:
+            buckets[key] = buckets.get(key, 0) + amount
+            sources.setdefault(key, []).append({"label": label, "amount": amount, "page": page, "file": "",
+                                               "trust": "consistent"})
+        if found:
+            values = taxonomy.compute(buckets, have_pl=True, have_bs=F.BALANCE_SHEET in have)
+            tax_note = ", ".join(label for _k, label, _a, _p in found)
+
+    # A company, LLP or firm that made a profit pays tax, and its P&L shows
+    # it. With no tax line read, profit after tax is not known: it is left
+    # unknown rather than shown equal to profit before tax. (A proprietor's
+    # tax is personal and never in the P&L, so this does not apply there.)
+    untaxed = False
+    if (F.PROFIT_LOSS in have and not buckets.get("provision_tax") and not buckets.get("provision_deferred_tax")
+            and (values.get("profit_before_tax") or 0) > 0 and _taxed_entity(identity, main)):
+        untaxed = True
+        for k in ("profit_after_tax", "profit_available", "cash_profit"):
+            values[k] = None
+
     # Screened the same way _main_entity screens its candidates: a line
     # already rejected as a name (an address, a sentence from a note page)
     # must not title the column just because it was the first one going.
@@ -652,6 +704,19 @@ def _assemble(year, blocks: list, docs: list, api_key: str = None,
                            if _belongs_to(b.get("entity", ""))), "")
 
     notes = taxonomy.assumptions(items, learned)
+    if tax_note:
+        notes.insert(0, {"label": tax_note, "amount": None, "target": "Provision for tax",
+                         "note": "An untagged line under the P&L named as tax, read as the tax provision."})
+    if untaxed:
+        notes.insert(0, {"label": "(tax)", "amount": None, "target": "Profit after tax",
+                         "note": ("No tax line was read on this P&L, and this taxpayer pays tax on its profit: "
+                                  "profit after tax, profit available and cash profit are left unknown.")})
+    if owner_note is not None:
+        notes.insert(0, {
+            "label": "Long Term Borrowings", "amount": None, "target": "Unsecured loans (quasi equity)",
+            "note": (f"Moved from secured loans: the note to accounts on page {owner_note[0]} says these are "
+                     f"unsecured loans from the owners or their relatives, which count as the owners' money."),
+        })
     from_comp = sorted({b["kind"].replace("_", " ") for b in usable
                         if b.get("from_comparative")})
     if from_comp:
@@ -696,6 +761,9 @@ def _assemble(year, blocks: list, docs: list, api_key: str = None,
     book, book_page = next(((d["book_profit"], d["book_profit_page"]) for d in docs
                             if d["year"] == year and d["book_profit"] is not None),
                            (None, None))
+    # The acknowledgement's own figures, from the file for this year.
+    return_figures = next((d["return_figures"] for d in docs
+                           if d["year"] == year and d.get("return_figures")), {})
     summary = {}
     for d in docs:
         for k, v in (d.get("page_summary") or {}).items():
@@ -726,13 +794,14 @@ def _assemble(year, blocks: list, docs: list, api_key: str = None,
         "comparative":    comparative,
         "book_profit":    book,
         "book_profit_page": book_page,
+        "return_figures": return_figures,
         "source_name":    " + ".join(os.path.basename(str(d["source_name"]))
                                      for d in docs),
         "warnings":       ([f"{' and '.join(from_comp)} taken from the comparative "
                             f"column of a later year's statement - no filing for "
                             f"this year was uploaded"] if from_comp else [])
                           + _warnings(blocks, usable, unmapped, mapping_check,
-                                    multi=len(docs) > 1)
+                                    multi=len(docs) > 1, return_figures=return_figures)
                           + _profit_crosscheck(values, ignored)
                           + _book_profit_crosscheck(values, book, book_page),
     }
@@ -827,7 +896,11 @@ def _looks_nil(blocks: list) -> bool:
     prints a dash in every cell of that year's comparative column.
     """
     if not blocks:
-        return True
+        # Nothing statement shaped at all is not evidence of a nil return:
+        # a proprietor's filing is often just the acknowledgement and the
+        # computation of income (a real one declared a 48 lakh business
+        # loss and was once labelled NIL here). _warnings says what it is.
+        return False
     biggest = max((abs(a) for b in blocks for _l, a in F.all_items(b["sides"])),
                   default=0)
     return biggest < _NIL_RETURN_MAX
@@ -840,7 +913,8 @@ def _where(b: dict, multi: bool) -> str:
     return f"page {b['page'] + 1}" + (f" of {src}" if src else "")
 
 
-def _warnings(blocks, usable, unmapped, mapping_check, multi: bool = False) -> list:
+def _warnings(blocks, usable, unmapped, mapping_check, multi: bool = False,
+              return_figures: dict = None) -> list:
     out = []
     for b in blocks:
         # A note/disclosure table (Reserves & Surplus, Share Capital, ...)
@@ -859,7 +933,11 @@ def _warnings(blocks, usable, unmapped, mapping_check, multi: bool = False) -> l
                        f"({b.get('entity') or 'unnamed'}) prints no total, so "
                        f"its figures could not be checked")
     if not usable:
-        if _looks_nil(blocks):
+        if not blocks and return_figures:
+            out.append("This file holds the return acknowledgement and computation "
+                       "of income only, no balance sheet or profit and loss "
+                       "account, so there are no financial statements to spread")
+        elif _looks_nil(blocks):
             out.append("This appears to be a NIL return - the financial "
                        "schedules are present but carry no figures. Common for "
                        "a company's first assessment year, before it began "
@@ -935,6 +1013,23 @@ def _recover_from_comparative(cols: list) -> None:
                         "P&L recovered from next year's comparative column, not "
                         "this document's own statement - treat with more "
                         "caution than a directly-verified figure")
+                elif rev is not None:
+                    # Revenue alone (the comparative printed no expenses total,
+                    # confirmed on a real filing): turnover is still the
+                    # figure a sales trend needs, so it is recovered, and
+                    # expenses and profit stay unknown rather than guessed.
+                    col["values"]["sales_other_income"] = rev
+                    col["assumptions"].append({
+                        "label": "(P&L revenue)", "amount": None, "target": "Turnover",
+                        "note": (f"This year's own P&L could not be read; Total "
+                                f"Revenue recovered from {source}'s own "
+                                f"comparative column instead. Expenses and "
+                                f"profit are NOT recovered and stay unknown."),
+                    })
+                    col["warnings"].append(
+                        "Turnover recovered from next year's comparative column, "
+                        "not this document's own statement - treat with more "
+                        "caution than a directly-verified figure")
 
             if kind == F.BALANCE_SHEET and col["values"].get("total_assets") is None:
                 assets = totals.get("total_assets")
@@ -955,6 +1050,39 @@ def _recover_from_comparative(cols: list) -> None:
                         "with more caution than a directly-verified figure")
 
 
+_TAX_LINE = re.compile(r"(?i)^\s*(?:\(\d\)\s*)?(current\s+(?:tax|year)|deferred\s+tax|tax\s+expenses?|income\s+tax)\s*$")
+_TAXED_ENTITY = re.compile(r"(?i)\b(limited|ltd|llp|private|pvt)\b")
+
+
+def _untagged_tax_lines(blocks: list, profit_before_tax) -> list:
+    """[(key, label, amount, page)] for untagged P&L lines named as tax,
+    each smaller than the profit before tax."""
+    out = []
+    if not profit_before_tax or profit_before_tax <= 0:
+        return out
+    for b in blocks:
+        if b.get("kind") != F.PROFIT_LOSS:
+            continue
+        for section in (b.get("sides") or {}).get("sections") or []:
+            for label, amount in section.get("items") or []:
+                if str(label).startswith("[") or not isinstance(amount, (int, float)):
+                    continue
+                if _TAX_LINE.match(str(label)) and 0 < amount < profit_before_tax:
+                    key = "provision_deferred_tax" if "deferred" in str(label).lower() else "provision_tax"
+                    page = None if b.get("page") is None else b["page"] + 1
+                    out.append((key, str(label).strip(), amount, page))
+    return out
+
+
+def _taxed_entity(identity: dict, entity: str) -> bool:
+    """A company, LLP or firm: its P&L carries its own tax. Read from the
+    ITR's assessee status, else the entity's name."""
+    status = str((identity or {}).get("assessee_status") or "").lower()
+    if status:
+        return status in ("company", "firm", "llp", "aop", "boi")
+    return bool(_TAXED_ENTITY.search(entity or ""))
+
+
 def _empty_column(source_name: str, warnings: list) -> dict:
     return {
         "year": None, "entity": "", "identity": {}, "scanned": False,
@@ -963,7 +1091,7 @@ def _empty_column(source_name: str, warnings: list) -> dict:
         "unmapped": [], "ignored": [], "assumptions": [],
         "mapping_check": {"ok": False, "diff": 0},
         "comparative": {}, "book_profit": None, "provisional": False,
-        "vision_pages": [], "source_name": source_name, "warnings": warnings,
+        "return_figures": {}, "vision_pages": [], "source_name": source_name, "warnings": warnings,
     }
 
 

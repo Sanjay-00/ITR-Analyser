@@ -1,0 +1,39 @@
+# Lets FinSight import this analyzer as `itr_engine`, side by side with the
+# Bank Statement and GST analyzers, whose top level packages are also named
+# `engine`. The engine/ folder itself is unchanged: this repo's own app and
+# tests keep importing `engine` exactly as before.
+#
+# Install editable only (pip install -e): engine/cache.py and
+# engine/mapping/taxonomy.py find data/ (the label map and the reading
+# cache) relative to their own files, which only exist in this repo.
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "itr-engine"
+version = "0.1.0"
+description = "ITR Extractor engine, importable as itr_engine"
+requires-python = ">=3.10"
+dependencies = [
+    "pymupdf>=1.24.0",
+    "openpyxl>=3.1.2",
+    "numpy>=1.24.0",
+    "Pillow>=10.0.0",
+    "pytesseract>=0.3.10",
+    "langchain-google-genai>=1.0.0",
+]
+
+[project.optional-dependencies]
+# Optional OCR backends, and the standalone Streamlit app; FinSight needs neither.
+ocr = ["rapidocr>=2.0.0", "onnxruntime>=1.18.0"]
+app = ["streamlit>=1.32.0", "pandas>=2.0.0", "python-dotenv>=1.0.0"]
+
+[tool.setuptools]
+package-dir = {"itr_engine" = "engine"}
+packages = [
+    "itr_engine",
+    "itr_engine.extract",
+    "itr_engine.ingest",
+    "itr_engine.mapping",
+]

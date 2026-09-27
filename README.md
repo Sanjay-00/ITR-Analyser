@@ -126,6 +126,17 @@ page and file ("SBI Cash Credit: 25.00 (p6, ITR 2024.pdf)"). The Audit Trail
 lists every sheet row's source lines in full. The breakdown is written only
 when it adds up to the figure exactly.
 
+**Every figure carries a trust level.** A statement that misses its own total
+by a hair (at most 0.5%) is kept rather than dropped, with only the affected
+rows marked. Six consistency checks - section totals, the sheet balancing
+after mapping, profit against the statement, the ITR computation and the
+capital account, and a year printed twice - dispute rows the evidence does not
+support. Where a year is printed twice (its own ITR, and the next year's
+comparative column), the two are compared and a field one printing lost is
+taken from the other. Disputed input rows are amber with a note; totals, the
+Snap, the ratios and the growth block are formulas over them and are never
+flagged twice. The Audit Trail lists every check.
+
 `tests/test_master_excel.py` evaluates the workbook's own formulas
 (`tests/xlsx_eval.py`) and checks them against the Python ratios.
 

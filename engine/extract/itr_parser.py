@@ -126,6 +126,50 @@ def extract_book_profit(page_texts: list):
     return None, None
 
 
+# ─────────────────────────────────────────────────────────────────
+# FIGURES FROM THE ITR-V ACKNOWLEDGEMENT
+# ─────────────────────────────────────────────────────────────────
+# The Income Tax department's acknowledgement is one fixed, numbered table
+# ("Total Income  1A  0", "Taxes Paid  7  3,19,862"). A proprietor's filing
+# often arrives as this page plus the CA's computation and nothing else, so
+# these are the only return figures there are. Read, never inferred.
+
+_ACK_PAGE_RE = re.compile(r"income\s+tax\s+return\s+acknowledge?ment|\bITR\s*-?\s*V\b", re.I)
+
+# label -> field; each value follows the row number ("1", "1A", "8").
+_ACK_FIELDS = [
+    ("current_year_business_loss", r"current\s+year\s+business\s+loss(?:\s*,\s*if\s+any)?"),
+    ("gross_total_income",         r"gross\s+total\s+income"),
+    ("total_income",               r"(?<!gross\s)(?<!adjusted\s)total\s+income(?!\s+under)"),
+    ("net_tax_payable",            r"net\s+tax\s+payable"),
+    ("taxes_paid",                 r"taxes\s+paid"),
+    ("tax_payable_or_refund",      r"\(\+\)\s*tax\s+payable\s*/\s*\(-\)\s*refundable\s*\(\s*\d+\s*-\s*\d+\s*\)"),
+]
+_ACK_VALUE = r"\s+\d{1,2}[A-Za-z]?\s+(\(-\)\s*|-\s*)?(\d[\d,]*)"
+
+ACK_FIELDS = [f for f, _ in _ACK_FIELDS]
+
+
+def extract_return_figures(page_texts: list) -> dict:
+    """
+    {field: int} from the first acknowledgement page, or {} when the document
+    has none. A refund reads negative, as the form itself prints "(-)".
+    """
+    for text in page_texts or []:
+        flat = re.sub(r"\s+", " ", text or "")
+        if not _ACK_PAGE_RE.search(flat):
+            continue
+        out = {}
+        for field, label in _ACK_FIELDS:
+            m = re.search(label + _ACK_VALUE, flat, re.I)
+            if m:
+                val = to_int(m.group(2))
+                out[field] = -val if (m.group(1) and val) else val
+        if out:
+            return out
+    return {}
+
+
 def _norm_ay(m) -> str:
     """('2023', '24' | '2024') → '2023-24'."""
     start, end = m.group(1), m.group(2)

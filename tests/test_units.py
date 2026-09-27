@@ -1212,3 +1212,66 @@ def test_a_period_range_names_the_year_it_ends_in():
     assert F._header_years(rows([(400, "2025"), (650, "2024")])) == [2025, 2024]
     assert F._header_years(rows([(400, "As at 31st March, 2025"),
                                  (650, "As at 31st March, 2024")])) == [2025, 2024]
+
+
+
+# ── The statement's year from fused or reordered column headers ──
+#    Borrower F FY2025 (2026-09-17): the heading's year is damaged in the
+#    scan ("Balance Sheet as at 31st March,?025"), so the column headers
+#    decide - and OCR fused both into ONE cell: "31st March 2025 31st March
+#    2024". The fallback took the smaller year: the FY2025 balance sheet was
+#    dated FY2024 (comparative FY2023), added to FY2024's own, and FY2025 had
+#    none (golden 27 -> 58 rows). The current period is always the LATEST
+#    year a statement's columns name, however they are printed.
+
+def _sample_f_bs_page(header_cells):
+    rows = [
+        [_w(10, 0, 400, "Balance Sheet as at 31st March,?025")],
+        [_w(10, 20, 200, "PARTICULARS"), _w(300, 20, 340, "NOTE NO"),
+         _w(420, 20, 470, "As at"), _w(620, 20, 670, "As at")],
+        header_cells,
+        [_w(10, 60, 200, "Owners' Capital Account"), _w(300, 60, 320, "3"),
+         _w(440, 60, 560, "1,00,00,000"), _w(640, 60, 760, "90,00,000")],
+        [_w(10, 80, 200, "Long-term borrowings"), _w(300, 80, 320, "4"),
+         _w(440, 80, 560, "2,00,00,000"), _w(640, 80, 760, "1,00,00,000")],
+        [_w(10, 100, 200, "Total Equity and Liabilities"),
+         _w(440, 100, 560, "3,00,00,000"), _w(640, 100, 760, "1,90,00,000")],
+        [_w(10, 120, 200, "Property, Plant and Equipment"), _w(300, 120, 320, "8"),
+         _w(440, 120, 560, "1,50,00,000"), _w(640, 120, 760, "90,00,000")],
+        [_w(10, 140, 200, "Trade receivables"), _w(300, 140, 320, "11"),
+         _w(440, 140, 560, "1,50,00,000"), _w(640, 140, 760, "1,00,00,000")],
+        [_w(10, 160, 200, "Total Assets"),
+         _w(440, 160, 560, "3,00,00,000"), _w(640, 160, 760, "1,90,00,000")],
+    ]
+    return [rows_with_cells(r, 900)[0] for r in rows]
+
+
+def test_fused_header_years_keep_their_printed_order():
+    rows = [rows_with_cells([_w(400, 0, 700, "31st March 2025 31st March 2024")], 900)[0]]
+    assert F._header_years(rows) == [2025, 2024]
+
+
+def test_a_damaged_heading_is_dated_by_the_latest_column_year():
+    fused = [_w(420, 40, 760, "31st March 2025 31st March 2024")]
+    blocks = F.find_blocks([_sample_f_bs_page(fused)])
+    years = sorted((b["year"], b.get("from_comparative", False)) for b in blocks)
+    assert years == [(2024, True), (2025, False)], years
+
+
+def test_previous_year_first_columns_still_date_the_statement_by_the_latest():
+    reordered = [_w(420, 40, 560, "31st March 2024"), _w(620, 40, 760, "31st March 2025")]
+    blocks = F.find_blocks([_sample_f_bs_page(reordered)])
+    assert max(b["year"] for b in blocks if not b.get("from_comparative")) == 2025
+
+
+def test_a_law_year_in_prose_is_never_a_statement_year():
+    """An audit-report sentence mistaken for a heading ("... as at the
+    balance sheet date.") carried "Act, 1948" in its prose; the fallback made
+    it an FY1948 statement and the workbook grew an FY1948 column."""
+    prose = [rows_with_cells([_w(10, n * 20, 800, t)], 900)[0] for n, t in enumerate([
+        "Micro, Small and Medium Enterprises covered under the Act, 1948",
+        "standard accounting software used by the assessee is not configured"])]
+    assert F._header_years(prose) == []
+    far = [rows_with_cells([_w(10, n * 20, 300, "remarks")], 900)[0] for n in range(8)]
+    far.append(rows_with_cells([_w(420, 200, 560, "31st March 2025")], 900)[0])
+    assert F._header_years(far) == []           # headers sit right under the heading

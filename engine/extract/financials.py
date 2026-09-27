@@ -808,7 +808,14 @@ def _repeats_heading(rows: list) -> bool:
 # A column header naming its period's year: "2025", "As at 31st March, 2025",
 # "31.03.2024". Read only ABOVE the statement's first figure - a year printed
 # further down is a line item's, not a column's.
-_HEADER_YEAR_RE = re.compile(r"(?<![\d,.])((?:19|20)\d{2})(?![\d,])")
+# Only a plausible STATEMENT year - 20xx. A law's year in prose ("... Act,
+# 1948") is never one: an audit-report sentence mistaken for a heading turned
+# it into an FY1948 statement and the workbook grew an FY1948 column (Borrower F
+# Roadways AY2025-26).
+_HEADER_YEAR_RE = re.compile(r"(?<![\d,.])(20\d{2})(?![\d,])")
+# Column headers sit directly under a statement's heading, not paragraphs
+# further down the page.
+_HEADER_ROWS = 6
 # "1-Apr-2023 to 31-Mar-2024" is ONE period, and it ends in 2024. Tally heads
 # every statement this way; read year by year, the range's START year was
 # taken and Borrower L's FY2024 statements were dated 2023 (69 rows off a
@@ -824,7 +831,7 @@ def _header_years(rows: list) -> list:
     pattern cannot parse; the columns still say which year each holds.
     """
     found = []
-    for _y, cells in rows:
+    for _y, cells in rows[:_HEADER_ROWS]:
         if _row_has_amount(cells):
             break
         for x0, _x1, txt in sorted(cells, key=lambda c: c[0]):
@@ -832,9 +839,12 @@ def _header_years(rows: list) -> list:
             ys = [int(m.group(1)) for m in _HEADER_YEAR_RE.finditer(wide)]
             if ys and _PERIOD_RANGE_RE.search(wide):
                 ys = ys[-1:]            # a range: the period it ENDS in
-            found.extend((x0, y) for y in ys)
+            # Keep each year's place WITHIN its cell: OCR fuses "31st March
+            # 2025 31st March 2024" into one cell, and sorting those by value
+            # reversed them.
+            found.extend((x0, n, y) for n, y in enumerate(ys))
     years = []
-    for _x, y in sorted(found):
+    for _x, _n, y in sorted(found):
         if y not in years:
             years.append(y)
     return years
@@ -871,8 +881,11 @@ def find_blocks(page_rows: list, only_pages=None) -> list:
             year, period = _find_period(lines, idx)
             header_years = _header_years(rows[idx + 1:end])
             if year is None and header_years:
-                # No readable date in the heading: the columns name the years.
-                year = header_years[0]
+                # No readable date in the heading: the columns name the years,
+                # and the current period is the LATEST of them - a statement
+                # never sets an older year beside a newer comparative, however
+                # its columns are ordered or fused (Borrower F FY2025).
+                year = max(header_years)
                 period = period or f"column header {year}"
             foot = _footer_at(body)
             if foot is not None:
@@ -946,9 +959,8 @@ def find_blocks(page_rows: list, only_pages=None) -> list:
             # trusted for being adjacent. Marked so the caller can prefer a
             # real statement for that year (columns.spread_many).
             if comp_sections and year and _has_items({"sections": comp_sections}):
-                prior_year = (header_years[1]
-                              if len(header_years) > 1 and header_years[1] < year
-                              else year - 1)
+                earlier = [y for y in header_years if y < year]
+                prior_year = max(earlier) if earlier else year - 1
                 prior = dict(blocks[-1])
                 prior.update({
                     "year":             prior_year,
